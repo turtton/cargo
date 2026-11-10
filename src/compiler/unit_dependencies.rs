@@ -476,8 +476,21 @@ fn compute_deps(
     Ok(ret)
 }
 
+/// The Rust library linked by these dependency declarations. Artifact
+/// dependencies opt in to linking it with `lib = true`.
+fn linked_dependency_lib<'a>(pkg: &'a Package, deps: &[&Dependency]) -> Option<&'a Target> {
+    if deps
+        .iter()
+        .any(|dep| dep.artifact().is_none_or(|artifact| artifact.is_lib()))
+    {
+        pkg.library()
+    } else {
+        None
+    }
+}
+
 /// Find artifacts for all `deps` of `unit` and add units that build these artifacts
-/// to `ret`.
+/// to `ret`. Returns the dependency's Rust library if it is linked.
 fn calc_artifact_deps<'a>(
     unit: &Unit,
     unit_for: UnitFor,
@@ -486,15 +499,11 @@ fn calc_artifact_deps<'a>(
     state: &State<'a, '_>,
     ret: &mut Vec<UnitDep>,
 ) -> CargoResult<Option<&'a Target>> {
-    let mut has_artifact_lib = false;
-    let mut maybe_non_artifact_lib = false;
     let artifact_pkg = state.get(dep_id);
     for dep in deps {
         let Some(artifact) = dep.artifact() else {
-            maybe_non_artifact_lib = true;
             continue;
         };
-        has_artifact_lib |= artifact.is_lib();
         // Custom build scripts (build/compile) never get artifact dependencies,
         // but the run-build-script step does (where it is handled).
         if !unit.target.is_custom_build() {
@@ -518,11 +527,7 @@ fn calc_artifact_deps<'a>(
             )?);
         }
     }
-    if has_artifact_lib || maybe_non_artifact_lib {
-        Ok(artifact_pkg.targets().iter().find(|t| t.is_lib()))
-    } else {
-        Ok(None)
-    }
+    Ok(linked_dependency_lib(artifact_pkg, deps))
 }
 
 /// Returns the dependencies needed to run a build script.
@@ -1284,15 +1289,8 @@ impl<'a, 'gctx> State<'a, 'gctx> {
             .package_deps(pkg_id, kind, false, false, unit_for)
             .into_iter()
             .all(|(dep_id, deps)| {
-                let links_lib = deps
-                    .iter()
-                    .any(|dep| dep.artifact().is_none_or(|artifact| artifact.is_lib()));
-                match self.get(dep_id).targets().iter().find(|t| t.is_lib()) {
-                    Some(lib) if links_lib && !lib.for_host() => {
-                        self.is_shareable(dep_id, unit_for, kind)
-                    }
-                    _ => true,
-                }
+                linked_dependency_lib(self.get(dep_id), &deps)
+                    .is_none_or(|lib| lib.for_host() || self.is_shareable(dep_id, unit_for, kind))
             });
         self.shareable.borrow_mut().insert(key, shareable);
         shareable
