@@ -1,4 +1,11 @@
-# huacnlee/cargo
+# turtton/cargo
+
+> **This is turtton's downstream build of [huacnlee/cargo](https://github.com/huacnlee/cargo)**,
+> itself a fork of [rust-lang/cargo](https://github.com/rust-lang/cargo). The
+> behaviour below is the upstream fork's; this repository adds its own
+> identification and Nix distribution. It is **not** the project at
+> `huacnlee.github.io/cargo`, and it is installed through Nix only (see
+> [Install](#install)).
 
 **Stop deleting `target`.**
 
@@ -7,17 +14,17 @@ share one build directory that stays under a size limit on its own, so you
 never clean it and never rebuild from scratch. Install it and you are done:
 there is nothing to configure.
 
-https://huacnlee.github.io/cargo/
+Upstream project page: https://huacnlee.github.io/cargo/
 
 ![Disktree treemap of a home directory: ~/.cargo/targets is 41.7 GB of 99.5 GB, with 711.9 GB of the disk free.](website/public/disktree.webp)
 
-Five days straight on my Linux and macOS computers, with no `target` cleaned and
+The upstream author used it five days straight on their Linux and macOS computers, with no `target` cleaned and
 no full disk. All Rust build output on this machine is 41.7 GB.
 
-Why and how I built it: [the background](https://huacnlee.github.io/cargo/why/) and
-[my posts on X](https://huacnlee.github.io/cargo/why/#posts).
+Why and how upstream built it: [the background](https://huacnlee.github.io/cargo/why/) and
+[their posts on X](https://huacnlee.github.io/cargo/why/#posts).
 
-**If this helps you, please [sponsor me](https://github.com/sponsors/huacnlee).**
+**If the upstream project helps you, please [sponsor its author](https://github.com/sponsors/huacnlee).**
 
 ## 中文介绍
 
@@ -25,57 +32,61 @@ Why and how I built it: [the background](https://huacnlee.github.io/cargo/why/) 
 
 这是一个可以直接替换官方 Cargo 的分支，为同时跑大量 git worktree 和 AI Agent 的电脑而做。
 所有 worktree 共用一个构建目录，它会自己控制在大小限制之内，所以不用清理，也不会再从头编译。
-只需要安装，不需要任何配置。
+只需要安装，不需要任何配置。（turtton/cargo 只通过 Nix 分发，见 Install。）
 
-在我的 Linux 和 macOS 电脑上已经连续用了 5 天，没有清理过 `target`，磁盘也没有再占满。上面
+上游作者在其 Linux 和 macOS 电脑上已经连续用了 5 天，没有清理过 `target`，磁盘也没有再占满。上面
 截图这台电脑的全部 Rust 构建产物一共 41.7 GB。
 
-为什么做、怎么做的，见[项目背景](https://huacnlee.github.io/cargo/zh-CN/why/)和[我在 X 上的记录](https://huacnlee.github.io/cargo/zh-CN/why/#posts)。
+上游为什么做、怎么做的，见[项目背景](https://huacnlee.github.io/cargo/zh-CN/why/)和[上游作者在 X 上的记录](https://huacnlee.github.io/cargo/zh-CN/why/#posts)。
 
-**如果这个项目帮到了你，请[赞助我](https://github.com/sponsors/huacnlee)。**
+**如果上游项目帮到了你，请[赞助其作者](https://github.com/sponsors/huacnlee)。**
 
 ## Install
 
-```sh
-curl -fsSL https://huacnlee.github.io/cargo/install.sh | sh
-```
+turtton/cargo is distributed as a Nix flake. There is no installer script and
+no binary release: `install.sh`, `install.ps1` and the `website/` directory
+are kept only as upstream's files and are not used, built or published here.
 
-Windows (PowerShell):
-
-```powershell
-irm https://huacnlee.github.io/cargo/install.ps1 | iex
-```
-
-This replaces `~/.cargo/bin/cargo` and keeps the rustup proxy as
-`cargo.rustup`.
-`cargo +nightly` and `rust-toolchain.toml` keep working. If you have a nightly
-toolchain, the installer adds its Cranelift component. `rustup self update`
-reinstalls the proxy, so rerun the installer after it.
-
-To uninstall and put the rustup proxy back:
+Run it once, without installing:
 
 ```sh
-curl -fsSL https://huacnlee.github.io/cargo/install.sh | sh -s -- --uninstall
+nix run github:turtton/cargo -- --version
 ```
 
-Windows (PowerShell):
+Install it into your profile:
 
-```powershell
-& ([scriptblock]::Create((irm https://huacnlee.github.io/cargo/install.ps1))) -Uninstall
+```sh
+nix profile install github:turtton/cargo
 ```
 
-It keeps itself up to date: at most once a day, after a command, cargo checks
-the latest release in the background and installs it the same way (checksum
-verified, renamed into place, so running builds are not disturbed). Nothing
-is printed; the last result is in `~/.cargo/.fork-update.log`. Set
-`CARGO_FORK_AUTO_UPDATE=0` to turn it off; it is also off in CI (`CI` set).
+Or add it to a flake (`inputs.turtton-cargo.url = "github:turtton/cargo";`) and
+use `inputs.turtton-cargo.packages.${system}.cargo`. Pin a revision with
+`github:turtton/cargo/<commit>`. Only `x86_64-linux` is built today.
+
+The flake's `nixConfig` lists a binary cache (attic) so that a build you have
+not done yourself is fetched, not compiled. Nix asks before trusting it unless
+you accept the flake config (`--accept-flake-config`) or already trust the
+substituter. Without it, the first build compiles Cargo with its static
+OpenSSL, curl and libgit2 (about the time of a Cargo release build).
+
+The binary is built with the `all-static` feature and the toolchain pinned in
+`flake.nix`; the version file `TURTTON_VERSION` names the release.
+
+**It never updates itself.** The upstream fork checked GitHub releases in the
+background and replaced `~/.cargo/bin/cargo`. That code is removed: this cargo
+does not contact any release server, and `CARGO_FORK_AUTO_UPDATE` has no
+effect. Update by changing the flake input (`nix flake update turtton-cargo`,
+or `nix profile upgrade`).
 
 Check which cargo is active:
 
 ```console
 $ cargo -V
-cargo 1.101.0 (ea4e34c28 2026-10-29) (huacnlee/cargo 0.102.0-1, https://huacnlee.github.io/cargo/)
+cargo 1.101.0 (ea4e34c28 2026-10-29) (turtton/cargo 0.102.0-9-turtton.1, https://github.com/turtton/cargo)
 ```
+
+`cargo +nightly` and `rust-toolchain.toml` keep working when rustup is
+installed next to it.
 
 ## Results
 
@@ -298,7 +309,10 @@ a list of known community-developed subcommands.
 
 ## Releases
 
-Cargo releases coincide with Rust releases.
+turtton/cargo publishes no GitHub release assets: the release is the
+`TURTTON_VERSION` file, and the Nix flake is the distribution.
+
+Upstream Cargo releases coincide with Rust releases.
 High level release notes are available as part of [Rust's release notes][rel].
 Detailed release notes are available in the [changelog].
 

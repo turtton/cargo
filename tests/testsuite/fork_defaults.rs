@@ -620,3 +620,78 @@ fn crates_reading_their_path_are_not_shared() {
 "#]])
         .run();
 }
+
+#[cargo_test]
+fn version_names_the_turtton_release() {
+    // TURTTON_VERSION is the single source of the release; read it at run time
+    // so that the test does not depend on the manifest directory at build time.
+    let manifest = std::env::var_os("CARGO_MANIFEST_DIR").unwrap();
+    let release = fs::read_to_string(PathBuf::from(manifest).join("TURTTON_VERSION")).unwrap();
+    let release = release.trim();
+    assert!(release.starts_with("0.102.0-") && release.contains("turtton"));
+
+    let version = cargo::version().to_string();
+    assert!(
+        version.contains(&format!(
+            "(turtton/cargo {release}, https://github.com/turtton/cargo)"
+        )),
+        "{version}"
+    );
+    assert!(!version.contains("huacnlee"), "{version}");
+}
+
+/// The fork no longer updates itself from huacnlee's releases. Run a copy of
+/// the binary installed as `$CARGO_HOME/bin/cargo`, the place the old updater
+/// recognised, with every switch that used to start it, and check that it
+/// behaves like plain cargo: no stamp or log file, no connection to the
+/// proxy that stands in for GitHub, and the internal child variable runs
+/// the command instead of an update.
+#[cargo_test]
+fn self_update_cannot_be_started() {
+    use std::net::TcpListener;
+
+    let home = paths::cargo_home();
+    let bin = home.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let installed = bin.join(format!("cargo{}", std::env::consts::EXE_SUFFIX));
+    fs::copy(crate::utils::cargo_exe(), &installed).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let proxy = format!("http://{}", listener.local_addr().unwrap());
+
+    let expected = format!("cargo {}\n", cargo::version());
+    for child_env in [None, Some(home.as_path())] {
+        let mut p = cargo_test_support::process(&installed);
+        p.arg("-V")
+            .env_remove("CI")
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("__CARGO_FORK_DEFAULTS_OPT_OUT")
+            .env("CARGO_HOME", &home)
+            .env("CARGO_FORK_AUTO_UPDATE", "1")
+            .env("https_proxy", &proxy)
+            .env("HTTPS_PROXY", &proxy)
+            .env("http_proxy", &proxy)
+            .env("HTTP_PROXY", &proxy)
+            .env("ALL_PROXY", &proxy);
+        if let Some(child_env) = child_env {
+            p.env("__CARGO_FORK_SELF_UPDATE", child_env);
+        }
+        cargo_test_support::execs()
+            .with_process_builder(p)
+            .with_stdout_data(expected.as_str())
+            .run();
+    }
+
+    // The old code stamped before it spawned and logged before it exited, so
+    // both files exist at once if either path is reachable.
+    for name in [".fork-update", ".fork-update.log"] {
+        assert!(!home.join(name).exists(), "{name} was written");
+    }
+    // Leave time for a detached child to connect, as the old one would.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    match listener.accept() {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        other => panic!("cargo contacted the proxy: {other:?}"),
+    }
+}

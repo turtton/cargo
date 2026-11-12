@@ -7,6 +7,9 @@ param(
     [switch]$Uninstall
 )
 $ErrorActionPreference = 'Stop'
+# turtton/cargo is distributed through Nix only (see README.md). This upstream
+# installer would download huacnlee/cargo releases, so it is disabled.
+throw 'install.ps1 is disabled in turtton/cargo: install it with Nix (nix profile install github:turtton/cargo).'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 if ($env:OS -ne 'Windows_NT') { throw 'This installer requires Windows. Use install.sh on macOS or Linux.' }
