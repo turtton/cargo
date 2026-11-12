@@ -155,6 +155,26 @@ impl<'a, 'gctx> JobState<'a, 'gctx> {
             .push(Message::Finish(self.id, Artifact::Metadata, Ok(())));
     }
 
+    pub fn unit_lock_status(&self, message: String) -> CargoResult<()> {
+        if let Some(dedupe) = self.output {
+            dedupe.gctx.shell().status("Blocking", message)?;
+        } else {
+            self.messages.push_bounded(Message::UnitLockStatus(message));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn run_locked(
+        &self,
+        lock: &LockKey,
+        probe: crate::compiler::fingerprint::PreparedFreshnessProbe,
+        dirty: super::Work,
+        fresh: super::Work,
+    ) -> CargoResult<()> {
+        self.lock_manager
+            .run_locked(lock, probe, dirty, fresh, self)
+    }
+
     pub fn lock_exclusive(&self, lock: &LockKey) -> CargoResult<()> {
         self.lock_manager.lock(lock)
     }

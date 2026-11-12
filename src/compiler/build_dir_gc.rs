@@ -69,7 +69,7 @@ use filetime::FileTime;
 use tracing::debug;
 
 use crate::compiler::BuildRunner;
-use crate::compiler::locking::GC_LOCK_FILE;
+use crate::compiler::locking::{GC_LOCK_FILE, WRITE_LOCK_FILE};
 use crate::compiler::shared_units::{self, OUT_LINKS_DIR};
 use crate::util::data_structures::HashSet;
 use crate::util::flock;
@@ -847,7 +847,7 @@ fn remove(path: &Path, removed: &mut Removed) -> CargoResult<u64> {
     if is_package && !is_legacy_unit_dir(path) {
         return Ok(0);
     }
-    let mut lock_files = vec![path.join(".lock")];
+    let mut lock_files = vec![path.join(WRITE_LOCK_FILE), path.join(".lock")];
     if let Ok(entries) = fs::read_dir(path) {
         lock_files.extend(
             entries
