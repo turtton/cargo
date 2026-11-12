@@ -520,40 +520,6 @@ pub fn prepare_target(
         .ok_or_else(|| internal("missing package source"))?;
     source.verify(unit.pkg.package_id())?;
 
-    // Clear out the old fingerprint file if it exists. This protects when
-    // compilation is interrupted leaving a corrupt file. For example, a
-    // project with a lib.rs and integration test (two units):
-    //
-    // 1. Build the library and integration test.
-    // 2. Make a change to lib.rs (NOT the integration test).
-    // 3. Build the integration test, hit Ctrl-C while linking. With gcc, this
-    //    will leave behind an incomplete executable (zero size, or partially
-    //    written). NOTE: The library builds successfully, it is the linking
-    //    of the integration test that we are interrupting.
-    // 4. Build the integration test again.
-    //
-    // Without the following line, then step 3 will leave a valid fingerprint
-    // on the disk. Then step 4 will think the integration test is "fresh"
-    // because:
-    //
-    // - There is a valid fingerprint hash on disk (written in step 1).
-    // - The mtime of the output file (the corrupt integration executable
-    //   written in step 3) is newer than all of its dependencies.
-    // - The mtime of the integration test fingerprint dep-info file (written
-    //   in step 1) is newer than the integration test's source files, because
-    //   we haven't modified any of its source files.
-    //
-    // But the executable is corrupt and needs to be rebuilt. Clearing the
-    // fingerprint at step 3 ensures that Cargo never mistakes a partially
-    // written output as up-to-date.
-    if loc.exists() {
-        // Truncate instead of delete so that compare_old_fingerprint will
-        // still log the reason for the fingerprint failure instead of just
-        // reporting "failed to read fingerprint" during the next build if
-        // this build fails.
-        paths::write(&loc, b"")?;
-    }
-
     let write_fingerprint = if unit.mode.is_run_custom_build() {
         // For build scripts the `local` field of the fingerprint may change
         // while we're executing it. For example it could be in the legacy
@@ -1028,15 +994,10 @@ impl PreparedFreshnessProbe {
         if reuse && self.force {
             return Ok(false);
         }
-        let mut fingerprint = self.fingerprint.execution_snapshot()?;
-        if reuse
-            && !fingerprint
-                .deps
-                .iter()
-                .all(|d| d.fingerprint.completed.load(Ordering::Acquire))
-        {
+        if reuse && !self.fingerprint.dependencies_completed() {
             return Ok(false);
         }
+        let mut fingerprint = self.fingerprint.execution_snapshot()?;
         if let Some(custom) = &self.custom {
             let deps = match custom.deps() {
                 Ok(deps) => deps,
@@ -1105,26 +1066,54 @@ impl PreparedFreshnessProbe {
     pub fn invalidate(&self) -> CargoResult<()> {
         paths::write(&self.loc, b"")
     }
-    pub fn completed(&self) {
-        self.fingerprint.completed.store(true, Ordering::Release);
-    }
 }
 
 impl Fingerprint {
+    fn dependencies_completed(&self) -> bool {
+        fn visit(fingerprint: &Fingerprint, seen: &mut HashSet<usize>) -> bool {
+            fingerprint.deps.iter().all(|d| {
+                let identity = Arc::as_ptr(&d.fingerprint) as usize;
+                !seen.insert(identity)
+                    || (d.fingerprint.completed.load(Ordering::Acquire)
+                        && visit(&d.fingerprint, seen))
+            })
+        }
+        visit(self, &mut HashSet::default())
+    }
+
     /// Refresh dependency output mtimes, never their planning-time fs_status.
+    /// Memoize this invocation's snapshots, not filesystem results across probes:
+    /// diamond-shaped dependency graphs must not expand exponentially.
     fn execution_snapshot(&self) -> CargoResult<Self> {
+        self.execution_snapshot_inner(&mut HashMap::default())
+    }
+
+    fn execution_snapshot_inner(
+        &self,
+        cache: &mut HashMap<(usize, bool), Arc<Self>>,
+    ) -> CargoResult<Self> {
         let mut deps = self.deps.clone();
         for dep in &mut deps {
-            let mut snapshot = dep.fingerprint.execution_snapshot()?;
+            let key = (
+                Arc::as_ptr(&dep.fingerprint) as usize,
+                dep.only_requires_rmeta,
+            );
+            if let Some(snapshot) = cache.get(&key) {
+                dep.fingerprint = Arc::clone(snapshot);
+                continue;
+            }
+            let mut snapshot = dep.fingerprint.execution_snapshot_inner(cache)?;
             let mtimes: Option<HashMap<_, _>> = snapshot
                 .outputs
                 .iter()
+                .filter(|p| !dep.only_requires_rmeta || p.extension().is_some_and(|e| e == "rmeta"))
                 .map(|p| Ok(optional_file(paths::mtime(p), p)?.map(|mtime| (p.clone(), mtime))))
                 .collect::<CargoResult<Option<_>>>()?;
             snapshot.fs_status = mtimes
                 .map(|mtimes| FsStatus::UpToDate { mtimes })
                 .unwrap_or(FsStatus::Stale);
             dep.fingerprint = Arc::new(snapshot);
+            cache.insert(key, Arc::clone(&dep.fingerprint));
         }
         Ok(Self {
             rustc: self.rustc,
@@ -2253,25 +2242,11 @@ fn local_fingerprints_deps(
     local
 }
 
-/// Returns a check, to run once the dependencies of `unit` are built, of
-/// whether another Cargo has built it into a shared build-dir with the same
-/// inputs since this one found it dirty: the fingerprint on disk is then the
-/// one this build would write.
-///
-/// Only meaningful for units whose fingerprint does not depend on mtimes, as
-/// is the case for registry and git packages.
-pub fn built_elsewhere(
-    build_runner: &BuildRunner<'_, '_>,
-    unit: &Unit,
-) -> Option<impl Fn() -> bool + Send + 'static> {
+/// Invalidate only after the executing job owns its write protection. A fresh
+/// replay must not invalidate or later write a dirty job's fingerprint.
+pub(super) fn invalidate_work(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> Work {
     let loc = build_runner.files().fingerprint_file_path(unit, "");
-    let fingerprint = Arc::clone(build_runner.fingerprints.get(unit)?);
-    Some(move || {
-        // Dependencies feed this fingerprint, so it is only final now.
-        fs::read_to_string(&loc).is_ok_and(|on_disk| {
-            !on_disk.is_empty() && on_disk == util::to_hex(fingerprint.hash_u64())
-        })
-    })
+    Work::new(move |_| paths::write(&loc, b""))
 }
 
 /// Writes the short fingerprint hash value to `<loc>`

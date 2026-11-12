@@ -164,23 +164,16 @@ impl<'a, 'gctx> JobState<'a, 'gctx> {
         Ok(())
     }
 
-    pub(crate) fn run_locked(
+    pub(in crate::compiler) fn run_locked(
         &self,
         lock: &LockKey,
         probe: crate::compiler::fingerprint::PreparedFreshnessProbe,
         dirty: super::Work,
+        done: super::Work,
         fresh: super::Work,
     ) -> CargoResult<()> {
         self.lock_manager
-            .run_locked(lock, probe, dirty, fresh, self)
-    }
-
-    pub fn lock_exclusive(&self, lock: &LockKey) -> CargoResult<()> {
-        self.lock_manager.lock(lock)
-    }
-
-    pub fn downgrade_to_shared(&self, lock: &LockKey) -> CargoResult<()> {
-        self.lock_manager.downgrade_to_shared(lock)
+            .run_locked(lock, probe, dirty, done, fresh, self)
     }
 
     pub fn on_section_timing_emitted(&self, section: SectionTiming) {

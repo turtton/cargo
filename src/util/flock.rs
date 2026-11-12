@@ -20,6 +20,7 @@ use anyhow::Context as _;
 use cargo_util::paths;
 
 pub(crate) use self::imp::lock_exclusive;
+#[cfg(test)]
 pub(crate) use self::imp::lock_shared;
 pub(crate) use self::imp::try_lock_exclusive;
 pub(crate) use self::imp::try_lock_shared;

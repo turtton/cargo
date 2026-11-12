@@ -120,18 +120,6 @@ impl LockManager {
         Ok(())
     }
 
-    // Transitional callers are removed when ordinary units use run_locked.
-    pub fn lock(&self, key: &LockKey) -> CargoResult<()> {
-        let file = key.slot.lock().unwrap();
-        flock::lock_exclusive(file.as_ref().context("missing unit lock")?.file())?;
-        Ok(())
-    }
-    pub fn downgrade_to_shared(&self, key: &LockKey) -> CargoResult<()> {
-        let file = key.slot.lock().unwrap();
-        flock::lock_shared(file.as_ref().context("missing unit lock")?.file())?;
-        Ok(())
-    }
-
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
     }
@@ -170,6 +158,7 @@ impl LockManager {
         key: &LockKey,
         probe: PreparedFreshnessProbe,
         dirty: Work,
+        done: Work,
         fresh: Work,
         state: &JobState<'_, '_>,
     ) -> CargoResult<()> {
@@ -202,7 +191,8 @@ impl LockManager {
         if result.is_err() {
             self.cancel();
         }
-        result
+        result?;
+        done.call(state)
     }
 
     fn acquire(

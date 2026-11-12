@@ -288,7 +288,11 @@ pub fn prepare(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResu
         .contains_key(metadata)
     {
         // The output is already set, thus the build script is overridden.
-        fingerprint::prepare_target(build_runner, unit, false)
+        let mut job = fingerprint::prepare_target(build_runner, unit, false)?;
+        if job.freshness().is_dirty() {
+            job.before(fingerprint::invalidate_work(build_runner, unit));
+        }
+        Ok(job)
     } else {
         build_work(build_runner, unit)
     }
@@ -747,7 +751,7 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
 
     let mut job = fingerprint::prepare_target(build_runner, unit, false)?;
     if job.freshness().is_dirty() {
-        job.before(dirty);
+        job.before(fingerprint::invalidate_work(build_runner, unit).then(dirty));
     } else {
         job.before(fresh);
     }
