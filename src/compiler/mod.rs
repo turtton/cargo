@@ -234,7 +234,7 @@ fn compile<'gctx>(
         fingerprint::prepare_init(build_runner, unit)?;
 
         let job = if unit.mode.is_run_custom_build() {
-            custom_build::prepare(build_runner, unit)?
+            custom_build::prepare(build_runner, unit, lock)?
         } else if unit.mode.is_doc_test() {
             // We run these targets later, so this is just a no-op for now.
             Job::new_fresh()

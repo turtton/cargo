@@ -279,7 +279,11 @@ impl LinkArgTarget {
 
 /// Prepares a `Work` that executes the target as a custom build script.
 #[tracing::instrument(skip_all)]
-pub fn prepare(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult<Job> {
+pub fn prepare(
+    build_runner: &mut BuildRunner<'_, '_>,
+    unit: &Unit,
+    lock: Option<super::locking::LockKey>,
+) -> CargoResult<Job> {
     let metadata = build_runner.get_run_build_script_metadata(unit);
     if build_runner
         .build_script_outputs
@@ -288,13 +292,18 @@ pub fn prepare(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResu
         .contains_key(metadata)
     {
         // The output is already set, thus the build script is overridden.
-        let mut job = fingerprint::prepare_target(build_runner, unit, false)?;
-        if job.freshness().is_dirty() {
-            job.before(fingerprint::invalidate_work(build_runner, unit));
-        }
-        Ok(job)
+        let job = fingerprint::prepare_target(build_runner, unit, false)?;
+        finish_job(
+            build_runner,
+            unit,
+            lock,
+            job,
+            Work::noop(),
+            Work::noop(),
+            Work::noop(),
+        )
     } else {
-        build_work(build_runner, unit)
+        build_work(build_runner, unit, lock)
     }
 }
 
@@ -333,7 +342,11 @@ fn emit_build_output(
 /// * Create the output dir (`OUT_DIR`) for the build script output.
 /// * Determine if the build script needs a re-run.
 /// * Run the build script and store its output.
-fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult<Job> {
+fn build_work(
+    build_runner: &mut BuildRunner<'_, '_>,
+    unit: &Unit,
+    lock: Option<super::locking::LockKey>,
+) -> CargoResult<Job> {
     assert!(unit.mode.is_run_custom_build());
     let bcx = &build_runner.bcx;
     let dependencies = build_runner.unit_deps(unit);
@@ -512,29 +525,21 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
     let host_target_root = build_runner.files().host_dest().map(|v| v.to_path_buf());
     let all = (
         id,
-        library_name.clone(),
-        pkg_descr.clone(),
         Arc::clone(&build_script_outputs),
-        run_files.stdout.clone(),
         script_out_dir.clone(),
     );
+    let replay = PreparedBuildOutput::new(build_runner, unit);
+    let done_outputs = Arc::clone(&build_script_outputs);
+    let done_dir = script_out_dir.clone();
     let build_scripts = build_runner.build_scripts.get(unit).cloned();
     let json_messages = bcx.build_config.emit_json();
     let extra_verbose = bcx.gctx.extra_verbose();
     let capture_rusage = bcx.capture_rusage();
-    let (prev_output, prev_script_out_dir) = prev_build_output(build_runner, unit);
     let metadata_hash = build_runner.get_run_build_script_metadata(unit);
-
-    paths::create_dir_all(&script_dir)?;
-    paths::create_dir_all(&script_out_dir)?;
-    paths::create_dir_all(&run_files.root)?;
 
     let nightly_features_allowed = build_runner.bcx.gctx.nightly_features_allowed;
     let targets: Vec<Target> = unit.pkg.targets().to_vec();
     let msrv = unit.pkg.rust_version().cloned();
-    // Need a separate copy for the fresh closure.
-    let targets_fresh = targets.clone();
-    let msrv_fresh = msrv.clone();
 
     let env_profile_name = unit.profile.name.to_uppercase();
     let built_with_debuginfo = build_runner
@@ -551,6 +556,8 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
     // Note that this has to do some extra work just before running the command
     // to determine extra environment variables and such.
     let dirty = Work::new(move |state| {
+        paths::create_dir_all(&script_dir)?;
+        paths::create_dir_all(&run_files.root)?;
         // Make sure that OUT_DIR exists.
         //
         // If we have an old build directory, then just move it into place,
@@ -709,9 +716,6 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
             &msrv,
         )?;
 
-        if json_messages {
-            emit_build_output(state, &parsed_output, script_out_dir.as_path(), id)?;
-        }
         build_script_outputs
             .lock()
             .unwrap()
@@ -723,20 +727,8 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
     // itself to run when we actually end up just discarding what we calculated
     // above.
     let fresh = Work::new(move |state| {
-        let (id, library_name, pkg_descr, build_script_outputs, output_file, script_out_dir) = all;
-        let output = match prev_output {
-            Some(output) => output,
-            None => BuildOutput::parse_file(
-                &output_file,
-                library_name,
-                &pkg_descr,
-                &prev_script_out_dir,
-                &script_out_dir,
-                nightly_features_allowed,
-                &targets_fresh,
-                &msrv_fresh,
-            )?,
-        };
+        let (id, build_script_outputs, script_out_dir) = all;
+        let output = replay.read()?;
 
         if json_messages {
             emit_build_output(state, &output, script_out_dir.as_path(), id)?;
@@ -749,9 +741,45 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
         Ok(())
     });
 
-    let mut job = fingerprint::prepare_target(build_runner, unit, false)?;
+    let done = Work::new(move |state| {
+        if json_messages {
+            let output = done_outputs
+                .lock()
+                .unwrap()
+                .get(metadata_hash)
+                .context("build script output missing after successful job")?
+                .clone();
+            emit_build_output(state, &output, &done_dir, id)?;
+        }
+        Ok(())
+    });
+    let job = fingerprint::prepare_target(build_runner, unit, false)?;
+    finish_job(build_runner, unit, lock, job, dirty, done, fresh)
+}
+
+/// Select the whole fresh replay, not just the command. In particular a reused
+/// script must register its latest output and must not commit a dirty fingerprint.
+fn finish_job(
+    build_runner: &mut BuildRunner<'_, '_>,
+    unit: &Unit,
+    lock: Option<super::locking::LockKey>,
+    mut job: Job,
+    dirty: Work,
+    done: Work,
+    fresh: Work,
+) -> CargoResult<Job> {
     if job.freshness().is_dirty() {
-        job.before(fingerprint::invalidate_work(build_runner, unit).then(dirty));
+        if let Some(lock) = lock {
+            let probe = fingerprint::PreparedFreshnessProbe::new(build_runner, unit, false)?;
+            build_runner.lock_manager.unlock(&lock)?;
+            job.before(dirty);
+            job.wrap(move |dirty| {
+                Work::new(move |state| state.run_locked(&lock, probe, dirty, done, fresh))
+            });
+        } else {
+            job.before(fingerprint::invalidate_work(build_runner, unit).then(dirty));
+            job.after(done);
+        }
     } else {
         job.before(fresh);
     }
