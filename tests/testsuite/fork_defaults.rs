@@ -133,6 +133,83 @@ fn gc_keeps_build_script_outputs_above_out_dir() {
 }
 
 #[cargo_test]
+fn gc_keeps_native_archive_of_build_script_under_pressure() {
+    // Same scenario as huacnlee/cargo#12: a build script puts a native archive
+    // where rusty_v8 does, three parents above `OUT_DIR`, and a test target
+    // links it before a library target does, both under GC pressure. The
+    // build script stays dependency-free and offline. The run count lives in
+    // the project, because anything inside the build directory could be
+    // collected together with the evidence of its removal.
+    let p = project()
+        .file(
+            "build.rs",
+            r#"
+            use std::{env, fs, path::PathBuf};
+
+            fn main() {
+                println!("cargo:rerun-if-changed=build.rs");
+                let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
+                let count = manifest.join("build-count");
+                let runs: u32 = fs::read_to_string(&count)
+                    .unwrap_or_default().parse().unwrap_or(0);
+                fs::write(count, (runs + 1).to_string()).unwrap();
+
+                let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+                let native = out.ancestors().nth(3).unwrap().join("gn_out/obj");
+                fs::create_dir_all(&native).unwrap();
+                let archive = if cfg!(windows) { "native_probe.lib" } else { "libnative_probe.a" };
+                fs::write(native.join(archive), b"!<arch>\n").unwrap();
+                fs::write(manifest.join("native-dir"), native.to_str().unwrap()).unwrap();
+                println!("cargo:rustc-link-search=native={}", native.display());
+                println!("cargo:rustc-link-lib=static=native_probe");
+            }
+            "#,
+        )
+        .file("src/lib.rs", "#[test] fn t() {}")
+        .build();
+    let pressure = |args: &str| {
+        fork_cargo(&p, args)
+            .env("CARGO_BUILD_GC_FREQUENCY", "always")
+            .env("CARGO_BUILD_GC_MAX_SIZE", "1 KiB")
+            .run();
+    };
+    let archive = if cfg!(windows) {
+        "native_probe.lib"
+    } else {
+        "libnative_probe.a"
+    };
+
+    // The test target links the archive before post-build GC runs.
+    pressure("test --lib --no-run");
+    let native = PathBuf::from(fs::read_to_string(p.root().join("native-dir")).unwrap());
+    // The archive belongs to the build script's run unit, so the unit's lock
+    // and the collector cover it.
+    assert!(
+        native.starts_with(shared_build_dir().join("debug/build")),
+        "{native:?}"
+    );
+    assert!(
+        native
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("fingerprint")
+            .is_dir()
+    );
+    assert!(native.join(archive).is_file());
+
+    // The library target links the same archive without running the script
+    // again.
+    pressure("build --lib");
+    assert!(native.join(archive).is_file());
+    assert_eq!(
+        fs::read_to_string(p.root().join("build-count")).unwrap(),
+        "1"
+    );
+}
+
+#[cargo_test]
 fn check_and_build_share_registry_dependencies() {
     Package::new("bar", "1.0.0")
         .file("src/lib.rs", "pub fn bar() {}")
