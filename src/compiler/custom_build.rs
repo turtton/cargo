@@ -1381,6 +1381,54 @@ pub fn build_map(build_runner: &mut BuildRunner<'_, '_>) -> CargoResult<()> {
     }
 }
 
+/// An owned recipe for loading the latest output, not the planning-time cache.
+pub(super) struct PreparedBuildOutput {
+    files: BuildScriptRunFiles,
+    out_dir: PathBuf,
+    library_name: Option<String>,
+    pkg_descr: String,
+    targets: Vec<Target>,
+    msrv: Option<RustVersion>,
+    nightly: bool,
+}
+
+impl PreparedBuildOutput {
+    pub fn new(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> Self {
+        Self {
+            files: BuildScriptRunFiles::for_unit(build_runner, unit),
+            out_dir: if build_runner.bcx.gctx.cli_unstable().build_dir_new_layout {
+                build_runner.files().out_dir_new_layout(unit)
+            } else {
+                build_runner.files().build_script_out_dir(unit)
+            },
+            library_name: unit.pkg.library().map(|t| t.crate_name()),
+            pkg_descr: unit.pkg.to_string(),
+            targets: unit.pkg.targets().to_vec(),
+            msrv: unit.pkg.rust_version().cloned(),
+            nightly: build_runner.bcx.gctx.nightly_features_allowed,
+        }
+    }
+
+    pub fn read(&self) -> CargoResult<BuildOutput> {
+        let previous =
+            paths::read_bytes(&self.files.root_output).and_then(|b| paths::bytes2path(&b))?;
+        BuildOutput::parse_file(
+            &self.files.stdout,
+            self.library_name.clone(),
+            &self.pkg_descr,
+            &previous,
+            &self.out_dir,
+            self.nightly,
+            &self.targets,
+            &self.msrv,
+        )
+    }
+
+    pub fn deps(&self) -> CargoResult<BuildDeps> {
+        Ok(BuildDeps::new(&self.files.stdout, Some(&self.read()?)))
+    }
+}
+
 /// Returns the previous parsed `BuildOutput`, if any, from a previous
 /// execution.
 ///

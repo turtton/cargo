@@ -121,6 +121,35 @@ pub struct UnitContent {
     pub hashed_at: FileTime,
 }
 
+/// Owned checkout policy, re-read under the unit lock rather than cached at planning.
+pub struct PreparedReuse {
+    marker: PathBuf,
+    checkout: String,
+    files: Arc<HashSet<PathBuf>>,
+}
+
+impl PreparedReuse {
+    pub fn check(&self) -> CargoResult<Reuse> {
+        let text = match fs::read_to_string(&self.marker) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                return Err(e).with_context(|| format!("failed to read {}", self.marker.display()));
+            }
+        };
+        let mut lines = text.lines();
+        let builder = lines.next().unwrap_or("");
+        let ours = builder == self.checkout;
+        Ok(match lines.next() {
+            _ if builder.is_empty() => Reuse::Rebuild(self.marker.clone()),
+            Some(UNVERIFIED) if ours => Reuse::Mtime,
+            Some(BOUND) if !ours => Reuse::Rebuild(self.marker.clone()),
+            Some(UNVERIFIED) => Reuse::Rebuild(self.marker.clone()),
+            _ => Reuse::Content(Arc::clone(&self.files)),
+        })
+    }
+}
+
 pub struct SharedUnits {
     /// Identifies this checkout: a hash of the workspace root.
     checkout: String,
@@ -202,19 +231,18 @@ impl SharedUnits {
 
     /// How the freshness check may treat a content-keyed unit built in
     /// `unit_dir`.
-    pub fn reuse(&self, unit: &Unit, unit_dir: &Path) -> Option<Reuse> {
+    pub fn reuse(&self, unit: &Unit, unit_dir: &Path) -> CargoResult<Option<Reuse>> {
+        self.prepare_reuse(unit, unit_dir)
+            .map(|probe| probe.check())
+            .transpose()
+    }
+
+    pub fn prepare_reuse(&self, unit: &Unit, unit_dir: &Path) -> Option<PreparedReuse> {
         let content = self.content(unit)?;
-        let marker = unit_dir.join(MARKER);
-        let text = fs::read_to_string(&marker).unwrap_or_default();
-        let mut lines = text.lines();
-        let builder = lines.next().unwrap_or("");
-        let ours = builder == self.checkout;
-        Some(match lines.next() {
-            _ if builder.is_empty() => Reuse::Rebuild(marker),
-            Some(UNVERIFIED) if ours => Reuse::Mtime,
-            Some(BOUND) if !ours => Reuse::Rebuild(marker),
-            Some(UNVERIFIED) => Reuse::Rebuild(marker),
-            _ => Reuse::Content(Arc::clone(&content.files)),
+        Some(PreparedReuse {
+            marker: unit_dir.join(MARKER),
+            checkout: self.checkout.clone(),
+            files: Arc::clone(&content.files),
         })
     }
 

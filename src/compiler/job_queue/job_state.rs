@@ -175,13 +175,22 @@ impl<'a, 'gctx> JobState<'a, 'gctx> {
 
     /// Drives a [`Job`] to finish. This ensures that a [`Message::Finish`] is
     /// sent even if our job panics.
-    pub(super) fn run_to_finish(self, job: Job) {
+    pub(super) fn run_to_finish(
+        self,
+        job: Job,
+        fingerprint: Option<Arc<crate::compiler::fingerprint::Fingerprint>>,
+    ) {
         let mut sender = FinishOnDrop {
             messages: &self.messages,
             id: self.id,
             result: None,
         };
         sender.result = Some(job.run(&self));
+        if sender.result.as_ref().unwrap().is_ok() {
+            if let Some(fingerprint) = fingerprint {
+                fingerprint.mark_completed();
+            }
+        }
 
         // If the `rmeta_required` wasn't consumed but it was set
         // previously, then we either have:

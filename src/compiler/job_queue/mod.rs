@@ -1015,6 +1015,7 @@ impl<'gctx> DrainState<'gctx> {
         let lock_manager = build_runner.lock_manager.clone();
         let warning_handling = build_runner.bcx.gctx.warning_handling().unwrap_or_default();
 
+        let fingerprint = build_runner.fingerprints.get(unit).cloned();
         let doit = move |diag_dedupe| {
             let state = JobState::new(
                 id,
@@ -1024,7 +1025,7 @@ impl<'gctx> DrainState<'gctx> {
                 lock_manager,
                 warning_handling,
             );
-            state.run_to_finish(job);
+            state.run_to_finish(job, fingerprint);
         };
 
         match is_fresh {
