@@ -83,8 +83,9 @@ jobs:
           # a build unless attic has it already.
           nix run --inputs-from . nixpkgs#attic-client -- login --set-default home https://attic.taile2777.ts.net "$ATTIC_TOKEN"
           nix run --inputs-from . nixpkgs#attic-client -- use home
-      - name: Evaluate the flake
-        run: nix flake check --no-build
+      # No `nix flake check --no-build` here: fenix reads the channel manifest
+      # (import from derivation), which cannot be fetched with --no-build on a
+      # store that does not have it yet. The builds evaluate the flake anyway.
       - name: Build the dependencies
         timeout-minutes: 90
         run: nix build -L .#cargo-deps --out-link result-deps
@@ -149,6 +150,10 @@ jobs:
           nix run --inputs-from . nixpkgs#attic-client -- use home
       - name: Substitute the package and its dependencies from attic
         run: |
+          # Evaluating the flake fetches the Rust channel manifest (import from
+          # derivation); that is not part of the cache and may be built.
+          nix eval --raw .#packages.x86_64-linux.cargo.drvPath
+          echo
           # --max-jobs 0 and no remote builders: a derivation that attic does
           # not serve fails here instead of being built locally.
           for attr in cargo cargo-deps attic-client; do
