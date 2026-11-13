@@ -187,6 +187,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
         custom_build::build_map(&mut self)?;
         self.check_collisions()?;
         self.compute_metadata_for_doc_units();
+        self.lock_manager.prepare_package_gc_locks(&self)?;
 
         // We need to make sure that if there were any previous docs already compiled,
         // they were compiled with the same Rustc version that we're currently using.

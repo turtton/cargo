@@ -781,6 +781,9 @@ fn finish_job(
             job.after(done);
         }
     } else {
+        if let Some(lock) = &lock {
+            lock.event("PlanningFresh")?;
+        }
         job.before(fresh);
     }
     Ok(job)

@@ -276,6 +276,9 @@ fn compile<'gctx>(
                     job.after(done);
                 }
             } else {
+                if let Some(lock) = &lock {
+                    lock.event("PlanningFresh")?;
+                }
                 job.before(fresh_work(build_runner)?);
             }
 
@@ -2485,7 +2488,7 @@ fn on_stderr_line_inner(
         trace!("found directive from rustc: `{}`", artifact.artifact);
         if artifact.artifact.ends_with(".rmeta") {
             debug!("looks like metadata finished early!");
-            state.rmeta_produced();
+            state.rmeta_produced()?;
         }
         return Ok(false);
     }

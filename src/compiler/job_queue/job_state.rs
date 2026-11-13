@@ -54,6 +54,7 @@ pub struct JobState<'a, 'gctx> {
     lock_manager: Arc<LockManager>,
 
     warning_handling: WarningHandling,
+    test_hook: crate::compiler::locking::TestHook,
 
     // Historical versions of Cargo made use of the `'a` argument here, so to
     // leave the door open to future refactorings keep it here.
@@ -68,6 +69,7 @@ impl<'a, 'gctx> JobState<'a, 'gctx> {
         rmeta_required: bool,
         lock_manager: Arc<LockManager>,
         warning_handling: WarningHandling,
+        test_hook: crate::compiler::locking::TestHook,
     ) -> Self {
         Self {
             id,
@@ -76,6 +78,7 @@ impl<'a, 'gctx> JobState<'a, 'gctx> {
             rmeta_required: Cell::new(rmeta_required),
             lock_manager,
             warning_handling,
+            test_hook,
             _marker: marker::PhantomData,
         }
     }
@@ -149,10 +152,12 @@ impl<'a, 'gctx> JobState<'a, 'gctx> {
     /// builds when required, and can be called at any time before a job ends.
     /// This should only be called once because a metadata file can only be
     /// produced once!
-    pub fn rmeta_produced(&self) {
+    pub fn rmeta_produced(&self) -> CargoResult<()> {
+        self.test_hook.event("MetadataProduced")?;
         self.rmeta_required.set(false);
         self.messages
             .push(Message::Finish(self.id, Artifact::Metadata, Ok(())));
+        Ok(())
     }
 
     pub fn unit_lock_status(&self, message: String) -> CargoResult<()> {
@@ -202,6 +207,12 @@ impl<'a, 'gctx> JobState<'a, 'gctx> {
         if sender.result.as_ref().unwrap().is_ok() {
             if let Some(fingerprint) = fingerprint {
                 fingerprint.mark_completed();
+            }
+        }
+
+        if sender.result.as_ref().unwrap().is_ok() {
+            if let Err(error) = self.test_hook.event("JobCompleted") {
+                sender.result = Some(Err(error));
             }
         }
 

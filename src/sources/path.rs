@@ -976,6 +976,43 @@ fn last_modified_file(
     pkg: &Package,
     gctx: &GlobalContext,
 ) -> CargoResult<(FileTime, PathBuf)> {
+    last_modified_file_excluding(path, pkg, gctx, None)
+}
+
+/// Legacy build-script freshness ignores only this build's actual output roots.
+/// Packaging keeps its existing file list; no directory-name heuristics apply.
+pub(crate) fn fingerprint_excluding(
+    pkg: &Package,
+    gctx: &GlobalContext,
+    output_roots: &[PathBuf],
+) -> CargoResult<String> {
+    let package_root = fs::canonicalize(pkg.root())
+        .with_context(|| format!("failed to resolve package root {}", pkg.root().display()))?;
+    let mut excluded = Vec::new();
+    for root in output_roots {
+        match fs::canonicalize(root) {
+            Ok(root) if root != package_root && root.starts_with(&package_root) => {
+                excluded.push(root);
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("failed to resolve output root {}", root.display()));
+            }
+        }
+    }
+    let (max, path) = last_modified_file_excluding(pkg.root(), pkg, gctx, Some(&excluded))?;
+    let relative = path.strip_prefix(pkg.root()).unwrap_or(&path);
+    Ok(format!("{} ({})", max, relative.display()))
+}
+
+fn last_modified_file_excluding(
+    path: &Path,
+    pkg: &Package,
+    gctx: &GlobalContext,
+    excluded: Option<&[PathBuf]>,
+) -> CargoResult<(FileTime, PathBuf)> {
     let mut max = FileTime::zero();
     let mut max_path = PathBuf::new();
     for file in list_files(pkg, gctx).with_context(|| {
@@ -984,12 +1021,36 @@ fn last_modified_file(
             pkg.root().display()
         )
     })? {
-        // An `fs::stat` error here is either because path is a
-        // broken symlink, a permissions error, or a race
-        // condition where this path was `rm`-ed -- either way,
-        // we can ignore the error and treat the path's `mtime`
-        // as `0`.
-        let mtime = paths::mtime(&file).unwrap_or_else(|_| FileTime::zero());
+        if let Some(excluded) = excluded {
+            match fs::canonicalize(&*file) {
+                Ok(real) if excluded.iter().any(|root| real.starts_with(root)) => continue,
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("failed to resolve source file {}", file.display())
+                    });
+                }
+            }
+        }
+        // Preserve Source's historical best-effort stat behavior. The shared
+        // planning/execution API instead distinguishes absent files from IO
+        // errors, so an unreadable source cannot silently become reusable.
+        let mtime = match paths::mtime(&file) {
+            Ok(mtime) => mtime,
+            Err(_) if excluded.is_none() => FileTime::zero(),
+            Err(error)
+                if error
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) =>
+            {
+                continue;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to stat source file {}", file.display()));
+            }
+        };
         // Break equal-mtime ties by path so filesystem iteration order does not
         // affect which file is recorded in the fingerprint.
         if mtime > max || (mtime == max && file.path.as_path() > max_path.as_path()) {

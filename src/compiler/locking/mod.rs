@@ -1,4 +1,4 @@
-//! Lock order: package GC SH -> writer gate EX -> unit EX/SH -> output link.
+//! Lock order: package GC SH -> writer gate EX -> unit EX/SH -> output-link lock.
 //! A gate holder never waits for unit EX. Reader conflicts are bounded; a
 //! live writer is not subject to that deadline. All OS waits are outside the
 //! manager's map mutexes, and every writer owns its file description.
@@ -21,6 +21,9 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
+
+mod test_hook;
+pub(in crate::compiler) use test_hook::TestHook;
 
 pub(super) const GC_LOCK_FILE: &str = ".cargo-gc-lock";
 pub(super) const WRITE_LOCK_FILE: &str = ".cargo-unit-write-lock";
@@ -54,12 +57,49 @@ impl LockManager {
         }
     }
 
+    /// Acquire every package's GC protection before the first unit lock.
+    /// GC only tries EX, so a builder's blocking SH can wait only for GC's
+    /// short deletion interval, never for a GC waiting on a builder unit.
+    pub fn prepare_package_gc_locks(&self, build_runner: &BuildRunner<'_, '_>) -> CargoResult<()> {
+        if !build_runner.bcx.gctx.cli_unstable().fine_grain_locking
+            || !build_runner.bcx.gctx.cli_unstable().build_dir_new_layout
+            || crate::workspace::features::is_fork_defaults_opt_out()
+        {
+            return Ok(());
+        }
+        debug_assert!(self.slots.lock().unwrap().is_empty());
+        debug_assert!(self.units.lock().unwrap().is_empty());
+        let mut packages: Vec<_> = build_runner
+            .bcx
+            .unit_graph
+            .keys()
+            .map(|unit| {
+                let path = build_runner.files().build_unit_lock(unit);
+                (path.parent().unwrap().parent().unwrap().to_path_buf(), unit)
+            })
+            .collect();
+        packages.sort_by(|a, b| a.0.cmp(&b.0));
+        packages.dedup_by(|a, b| a.0 == b.0);
+        for (path, unit) in packages {
+            // One descriptor per physical package directory (deduplicated
+            // across its compile/run-build-script units). No map mutex spans IO.
+            let lock = Filesystem::new(path.clone()).open_ro_shared_create(
+                GC_LOCK_FILE, build_runner.bcx.gctx, "package build directory",
+            ).with_context(|| format!("failed to acquire package GC protection at {}; one file descriptor is required per package build directory", path.display()))?;
+            self.gc_locks.lock().unwrap().insert(path.clone(), lock);
+            TestHook::new(build_runner, unit, &path.join(GC_LOCK_FILE))
+                .event("PackageGcAcquired")?;
+        }
+        Ok(())
+    }
+
     pub fn lock_shared(
         &self,
         build_runner: &BuildRunner<'_, '_>,
         unit: &Unit,
     ) -> CargoResult<LockKey> {
         let path = build_runner.files().build_unit_lock(unit);
+        let hook = TestHook::new(build_runner, unit, &path);
         let timeout = conflict_timeout(build_runner.bcx.gctx.get_env_os(TIMEOUT_ENV))?;
         if build_runner.bcx.gctx.cli_unstable().build_dir_new_layout
             && !crate::workspace::features::is_fork_defaults_opt_out()
@@ -67,14 +107,10 @@ impl LockManager {
             let pkg_dir = path.parent().unwrap().parent().unwrap().to_path_buf();
             let held = self.gc_locks.lock().unwrap().contains_key(&pkg_dir);
             if !held {
-                // Never acquire a package lock under a unit lock, or wait while
-                // holding the manager map mutex.
-                let lock = Filesystem::new(pkg_dir.clone()).open_ro_shared_create(
-                    GC_LOCK_FILE,
-                    build_runner.bcx.gctx,
-                    "package build directory",
-                )?;
-                self.gc_locks.lock().unwrap().entry(pkg_dir).or_insert(lock);
+                return Err(crate::util::internal(format!(
+                    "package GC protection was not prepared before unit locking: {}",
+                    pkg_dir.display()
+                )));
             }
         }
         let description = format!(
@@ -96,8 +132,11 @@ impl LockManager {
                 )?;
                 announced = true;
             }
-            self.pause(backoff(0))?;
+            if hook.event("WaitingWriter")?.is_none() {
+                self.pause(backoff(0))?;
+            }
         };
+        hook.event("PlanningShared")?;
         let slot = Arc::new(Mutex::new(Some(file)));
         self.slots.lock().unwrap().push(Arc::clone(&slot));
         let unit = Arc::clone(self.units.lock().unwrap().entry(path.clone()).or_default());
@@ -107,6 +146,7 @@ impl LockManager {
             timeout,
             slot,
             unit,
+            hook,
         })
     }
 
@@ -142,6 +182,19 @@ impl LockManager {
         self.check_cancelled()?;
         Ok(start.elapsed())
     }
+    fn wait(&self, key: &LockKey, kind: WaitKind, duration: Duration) -> CargoResult<Duration> {
+        let phase = match kind {
+            WaitKind::WaitingWriter => "WaitingWriter",
+            WaitKind::ConflictingReaders => "ConflictingReaders",
+        };
+        if let Some(elapsed) = key.hook.event(phase)? {
+            self.check_cancelled()?;
+            Ok(elapsed)
+        } else {
+            self.pause(duration)
+        }
+    }
+
     pub fn release_gc_locks(&self) {
         self.gc_locks.lock().unwrap().clear();
     }
@@ -162,13 +215,18 @@ impl LockManager {
         fresh: Work,
         state: &JobState<'_, '_>,
     ) -> CargoResult<()> {
+        key.hook.event("ReadyToRun")?;
         let (mut guard, reused) = self.acquire(key, &|| probe.is_fresh(), &|message| {
             state.unit_lock_status(message.to_owned())
         })?;
         if reused {
+            key.hook.event("SharedValidated")?;
             guard.release_gate();
+            key.hook.event("GateReleased")?;
+            key.hook.event("FreshReuse")?;
             return fresh.call(state);
         }
+        key.hook.event("WriterAcquired")?;
         if let Err(error) = probe.invalidate() {
             self.cancel();
             return Err(error);
@@ -176,6 +234,7 @@ impl LockManager {
         // A command failure has already waited for its child to exit. Keep
         // normal --keep-going semantics; only protocol failures are fatal.
         dirty.call(state)?;
+        key.hook.event("WorkFinished")?;
         let result = (|| {
             guard.downgrade(self)?;
             if !probe.verify_written()? {
@@ -185,11 +244,14 @@ impl LockManager {
                     key.path.display()
                 );
             }
+            key.hook.event("SharedValidated")?;
             guard.release_gate();
+            key.hook.event("GateReleased")?;
             Ok(())
         })();
         if result.is_err() {
             self.cancel();
+            key.hook.event("FatalConflict")?;
         }
         result?;
         done.call(state)
@@ -204,6 +266,7 @@ impl LockManager {
         let result = self.acquire_inner(key, fresh, status);
         if result.is_err() {
             self.cancel();
+            key.hook.event("FatalConflict")?;
         }
         result
     }
@@ -221,14 +284,20 @@ impl LockManager {
             self.check_cancelled()?;
             let Some(mut guard) = OwnedUnit::claim(key)? else {
                 announce(&mut announced, key, status)?;
-                budget.record(WaitKind::WaitingWriter, self.pause(backoff(attempt))?);
+                budget.record(
+                    WaitKind::WaitingWriter,
+                    self.wait(key, WaitKind::WaitingWriter, backoff(attempt))?,
+                );
                 continue;
             };
             if !guard.try_gate()? {
                 drop(guard);
                 announce(&mut announced, key, status)?;
                 // WaitingWriter: deliberately do not charge the conflict budget.
-                budget.record(WaitKind::WaitingWriter, self.pause(backoff(attempt))?);
+                budget.record(
+                    WaitKind::WaitingWriter,
+                    self.wait(key, WaitKind::WaitingWriter, backoff(attempt))?,
+                );
                 continue;
             }
             if try_lock(flock::try_lock_exclusive(guard.file()), key)? {
@@ -278,7 +347,10 @@ impl LockManager {
                     key.timeout.as_secs()
                 );
             }
-            budget.record(WaitKind::ConflictingReaders, self.pause(backoff(attempt))?);
+            budget.record(
+                WaitKind::ConflictingReaders,
+                self.wait(key, WaitKind::ConflictingReaders, backoff(attempt))?,
+            );
             attempt = attempt.saturating_add(1);
         }
     }
@@ -358,6 +430,13 @@ pub struct LockKey {
     timeout: Duration,
     slot: Slot,
     unit: Arc<UnitEntry>,
+    hook: TestHook,
+}
+impl LockKey {
+    pub(super) fn event(&self, phase: &str) -> CargoResult<()> {
+        self.hook.event(phase)?;
+        Ok(())
+    }
 }
 impl Display for LockKey {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -422,6 +501,7 @@ impl OwnedUnit {
         // Make the conversion gap explicit; the writer gate, not flock's
         // conversion atomicity, protects this transition.
         self.unlock()?;
+        self.key.hook.event("DowngradeGap")?;
         for _ in 0..8 {
             if try_lock(flock::try_lock_shared(self.file()), &self.key)? {
                 self.shared = true;
@@ -465,6 +545,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             slot: Arc::new(Mutex::new(Some(file))),
             unit,
+            hook: TestHook::default(),
         }
     }
 

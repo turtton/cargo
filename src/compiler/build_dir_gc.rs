@@ -848,19 +848,26 @@ fn remove(path: &Path, removed: &mut Removed) -> CargoResult<u64> {
         return Ok(0);
     }
     let mut lock_files = vec![path.join(WRITE_LOCK_FILE), path.join(".lock")];
-    if let Ok(entries) = fs::read_dir(path) {
-        lock_files.extend(
-            entries
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|e| e == "lock")),
-        );
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().is_some_and(|e| e == "lock") {
+            lock_files.push(path);
+        }
     }
     // Held until the directory is gone.
     let mut _locks = Vec::new();
     for lock_file in lock_files {
-        let Ok(file) = fs::File::open(&lock_file) else {
-            continue;
+        let file = match fs::File::open(&lock_file) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            // Never bypass a gate/unit/incremental lock on an IO error. The
+            // caller reports GC errors as warnings without failing the build.
+            Err(e) => return Err(e.into()),
         };
         match flock::try_lock_exclusive(&file) {
             Ok(()) => _locks.push(file),

@@ -474,7 +474,10 @@ pub fn prepare_target(
     // compare it to an old version, if any, and attempt to print diagnostic
     // information about failed comparisons to aid in debugging.
     let fingerprint = calculate(build_runner, unit)?;
-    let mtime_on_use = build_runner.bcx.gctx.cli_unstable().mtime_on_use;
+    // This best-effort GC hint must not mutate fingerprints under unit SH.
+    // Fine-grained writers exclusively own every fingerprint modification.
+    let mtime_on_use =
+        bcx.gctx.cli_unstable().mtime_on_use && !bcx.gctx.cli_unstable().fine_grain_locking;
     let dirty_reason = match compare_old_fingerprint(unit, &loc, &*fingerprint, mtime_on_use, force)
     {
         FingerprintComparison::Fresh => None,
@@ -945,14 +948,14 @@ impl PreparedFreshnessProbe {
                     .to_path_buf();
                 let root = pkg.root().to_path_buf();
                 let source_id = pkg.package_id().source_id();
+                let output_roots = legacy_output_roots(build_runner.bcx);
                 Some(Box::new(move || {
                     // Only source enumeration needs a context; construct it on this
                     // thread, so no non-Send context is captured by the job.
-                    use crate::sources::source::Source;
                     let gctx = GlobalContext::new(crate::Shell::new(), cwd.clone(), home.clone());
                     let source = crate::sources::path::PathSource::new(&root, source_id, &gctx);
                     let pkg = source.root_package()?;
-                    source.fingerprint(&pkg)
+                    crate::sources::path::fingerprint_excluding(&pkg, &gctx, &output_roots)
                 }))
             } else {
                 let value = pkg_fingerprint(build_runner.bcx, &pkg)?;
@@ -997,6 +1000,9 @@ impl PreparedFreshnessProbe {
         if reuse && !self.fingerprint.dependencies_completed() {
             return Ok(false);
         }
+        let Some(on_disk) = read_completed_fingerprint(&self.loc)? else {
+            return Ok(false);
+        };
         let mut fingerprint = self.fingerprint.execution_snapshot()?;
         if let Some(custom) = &self.custom {
             let deps = match custom.deps() {
@@ -1010,7 +1016,13 @@ impl PreparedFreshnessProbe {
                     return Ok(false);
                 }
                 Err(e) => {
-                    return Err(e).context("failed to reload build script output for freshness");
+                    if e.chain().any(|e| e.downcast_ref::<io::Error>().is_some()) {
+                        return Err(e)
+                            .context("failed to reload build script output for freshness");
+                    }
+                    // A completed fingerprint accompanied by incomplete or
+                    // malformed script output is not a reusable result.
+                    return Ok(false);
                 }
             };
             let local = if deps.rerun_if_changed.is_empty() && deps.rerun_if_env_changed.is_empty()
@@ -1046,14 +1058,6 @@ impl PreparedFreshnessProbe {
             &self.environment,
             shared_files,
         )?;
-        let on_disk = match fs::read_to_string(&self.loc) {
-            Ok(value) => value,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(e) => {
-                return Err(e)
-                    .with_context(|| format!("failed to read fingerprint {}", self.loc.display()));
-            }
-        };
         let fresh =
             fingerprint.fs_status.up_to_date() && on_disk == util::to_hex(fingerprint.hash_u64());
         if fresh {
@@ -2369,9 +2373,28 @@ fn _compare_old_fingerprint(
     Ok(FingerprintComparison::Dirty { reason })
 }
 
+/// Actual roots only, shared by planning and execution-time legacy checks.
+fn legacy_output_roots(bcx: &BuildContext<'_, '_>) -> Vec<PathBuf> {
+    let mut roots = vec![
+        bcx.ws.build_dir().into_path_unlocked(),
+        bcx.ws.target_dir().into_path_unlocked(),
+    ];
+    if let Some(shared) = bcx.ws.shared_deps_dir() {
+        roots.push(shared);
+    }
+    roots
+}
+
 /// Calculates the fingerprint of a unit thats contains no dep-info files.
 fn pkg_fingerprint(bcx: &BuildContext<'_, '_>, pkg: &Package) -> CargoResult<String> {
     let source_id = pkg.package_id().source_id();
+    if source_id.is_path() && bcx.gctx.cli_unstable().fine_grain_locking {
+        return crate::sources::path::fingerprint_excluding(
+            pkg,
+            bcx.gctx,
+            &legacy_output_roots(bcx),
+        );
+    }
     let sources = bcx.packages.sources();
 
     let source = sources
@@ -2380,8 +2403,19 @@ fn pkg_fingerprint(bcx: &BuildContext<'_, '_>, pkg: &Package) -> CargoResult<Str
     source.fingerprint(pkg)
 }
 
-/// The `reference` file is considered as "stale" if any file from `paths` has a newer mtime.
-/// A missing file means dirty; other I/O failures are not freshness decisions.
+/// Invalidation and interrupted writes must not authorize reuse, including
+/// malformed bytes that are not UTF-8. Only a complete hex hash can be fresh.
+fn read_completed_fingerprint(path: &Path) -> CargoResult<Option<String>> {
+    let Some(value) = optional_file(fs::read(path), path)? else {
+        return Ok(None);
+    };
+    if value.len() != std::mem::size_of::<u64>() * 2 || !value.iter().all(u8::is_ascii_hexdigit) {
+        return Ok(None);
+    }
+    Ok(Some(String::from_utf8(value).unwrap()))
+}
+
+/// Missing files are freshness misses; other IO failures must retain context.
 fn optional_file<T, E: Into<anyhow::Error>>(
     result: Result<T, E>,
     path: &Path,
@@ -2402,6 +2436,7 @@ fn optional_file<T, E: Into<anyhow::Error>>(
     }
 }
 
+/// The `reference` file is stale if an input is newer (or has a changed checksum).
 fn find_stale_file<I, P>(
     mtime_cache: &mut HashMap<PathBuf, FileTime>,
     checksum_cache: &mut HashMap<PathBuf, Checksum>,
@@ -2587,6 +2622,45 @@ mod execution_tests {
                 .fs_status
                 .up_to_date()
         );
+    }
+
+    #[test]
+    fn completed_pipelined_parent_does_not_hide_an_unfinished_dependency() {
+        let dependency = Arc::new(Fingerprint::new());
+        let mut middle = Fingerprint::new();
+        middle.deps.push(DepFingerprint {
+            pkg_id: 0,
+            name: "dependency".into(),
+            public: false,
+            only_requires_rmeta: true,
+            fingerprint: dependency.clone(),
+        });
+        middle.mark_completed();
+        let mut root = Fingerprint::new();
+        root.deps.push(DepFingerprint {
+            pkg_id: 1,
+            name: "middle".into(),
+            public: false,
+            only_requires_rmeta: true,
+            fingerprint: Arc::new(middle),
+        });
+        assert!(!root.dependencies_completed());
+        dependency.mark_completed();
+        assert!(root.dependencies_completed());
+    }
+
+    #[test]
+    fn unfinished_fingerprints_are_dirty_including_non_utf8_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fingerprint");
+        assert!(read_completed_fingerprint(&path).unwrap().is_none());
+        for unfinished in [&b""[..], &b"1234"[..], &[0xff; 16][..]] {
+            fs::write(&path, unfinished).unwrap();
+            assert!(read_completed_fingerprint(&path).unwrap().is_none());
+        }
+        let complete = util::to_hex(1);
+        fs::write(&path, &complete).unwrap();
+        assert_eq!(read_completed_fingerprint(&path).unwrap(), Some(complete));
     }
 
     #[test]

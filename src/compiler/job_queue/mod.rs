@@ -1035,6 +1035,11 @@ impl<'gctx> DrainState<'gctx> {
         let warning_handling = build_runner.bcx.gctx.warning_handling().unwrap_or_default();
 
         let fingerprint = build_runner.fingerprints.get(unit).cloned();
+        let test_hook = crate::compiler::locking::TestHook::new(
+            build_runner,
+            unit,
+            &build_runner.files().build_unit_lock(unit),
+        );
         let doit = move |diag_dedupe| {
             let state = JobState::new(
                 id,
@@ -1043,6 +1048,7 @@ impl<'gctx> DrainState<'gctx> {
                 rmeta_required,
                 lock_manager,
                 warning_handling,
+                test_hook,
             );
             state.run_to_finish(job, fingerprint);
         };

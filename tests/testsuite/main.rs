@@ -197,6 +197,7 @@ mod test;
 mod timings;
 mod tool_paths;
 mod unit_graph;
+mod unit_lock_protocol;
 mod update;
 mod utils;
 mod vendor;
