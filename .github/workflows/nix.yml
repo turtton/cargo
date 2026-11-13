@@ -1,0 +1,162 @@
+# Builds the Nix package (x86_64-linux), runs its install check, and publishes
+# the result to the attic cache for trusted events only.
+#
+#   pull_request            build + install check. Secrets are used only for a
+#                           pull request from this repository (the gate step);
+#                           a fork gets neither secrets nor the cache, and
+#                           builds from scratch.
+#   push to main, v* tag    the same, then push the closures to attic and
+#                           verify from an empty store that attic serves them.
+#   workflow_dispatch       build + install check; never publishes.
+#
+# Without TS_OAUTH_CLIENT_ID, TS_OAUTH_SECRET and ATTIC_TOKEN the job still
+# builds and checks; it just skips Tailscale, the cache and the push.
+name: Nix
+
+on:
+  pull_request:
+    # No branch filter: a pull request stacked on another branch is built too.
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  # A push to main or a tag must finish: it publishes to the cache.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Build steps are capped at 90 minutes and the attic push at 60.
+    timeout-minutes: 160
+    outputs:
+      pushed: ${{ steps.record.outputs.pushed }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+      - name: Tag matches TURTTON_VERSION
+        if: github.ref_type == 'tag'
+        run: test "$GITHUB_REF_NAME" = "v$(cat TURTTON_VERSION)"
+      # Fork pull requests get no secrets from GitHub; the head repository test
+      # states the same rule. A same-repository pull request may read the
+      # cache but never pushes (see the push step).
+      - name: Decide whether the attic cache can be used
+        id: gate
+        env:
+          TRUSTED: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+          TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
+          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
+        run: |
+          if [ "$TRUSTED" = true ] && [ -n "$TS_OAUTH_CLIENT_ID" ] && [ -n "$TS_OAUTH_SECRET" ] && [ -n "$ATTIC_TOKEN" ]; then
+            echo "attic=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "attic=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::attic cache not used (untrusted pull request or secrets not set)"
+          fi
+      - name: Connect to Tailscale
+        if: steps.gate.outputs.attic == 'true'
+        uses: tailscale/github-action@780049a30b6ff5c378a9e7b389d15ece7a204888  # v4.1.3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:nix
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24  # v31.11.1
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set up the attic client and cache
+        if: steps.gate.outputs.attic == 'true'
+        env:
+          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
+        run: |
+          # nixpkgs' client is in cache.nixos.org; the patched one below needs
+          # a build unless attic has it already.
+          nix run --inputs-from . nixpkgs#attic-client -- login --set-default home https://attic.taile2777.ts.net "$ATTIC_TOKEN"
+          nix run --inputs-from . nixpkgs#attic-client -- use home
+      - name: Evaluate the flake
+        run: nix flake check --no-build
+      - name: Build the dependencies
+        timeout-minutes: 90
+        run: nix build -L .#cargo-deps --out-link result-deps
+      # The package's install check runs in the Nix sandbox as part of this
+      # build: version, a minimal offline build, linked libraries, no
+      # self-update.
+      - name: Build and check the package
+        timeout-minutes: 90
+        run: nix build -L .#cargo --out-link result-cargo
+      - name: Check the installed copy outside the sandbox
+        timeout-minutes: 10
+        run: |
+          ./result-cargo/bin/cargo -V | tee version.txt
+          grep -F "turtton/cargo $(cat TURTTON_VERSION)," version.txt
+          bash ci/smoke-installed.sh "$PWD/result-cargo/bin/cargo"
+      - name: Build the smoke check
+        timeout-minutes: 30
+        run: nix build -L .#checks.x86_64-linux.smoke --no-link
+      # Built on every event so that a change to its patch is caught in the
+      # pull request, not after the merge.
+      - name: Build the patched attic client
+        timeout-minutes: 90
+        run: nix build -L .#attic-client --out-link result-attic
+      # Only a push to main or a v* tag publishes: a pull request, even one
+      # from this repository, never writes to the cache.
+      - name: Push to attic
+        id: push
+        if: steps.gate.outputs.attic == 'true' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref_type == 'tag')
+        timeout-minutes: 60
+        run: |
+          # How the runner reaches attic (direct or DERP relay) bounds throughput.
+          timeout 60 sudo tailscale ping -c 3 attic.taile2777.ts.net || true
+          ci/push-attic.sh result-attic result-cargo result-deps
+      - name: Record the push
+        id: record
+        run: echo "pushed=${{ steps.push.outcome == 'success' }}" >> "$GITHUB_OUTPUT"
+
+  # A fresh runner has an empty Nix store. With builds switched off, `nix build`
+  # can only succeed by substituting the package and its dependencies from
+  # attic, which shows that what was pushed is usable.
+  verify-cache:
+    needs: build
+    if: needs.build.outputs.pushed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@780049a30b6ff5c378a9e7b389d15ece7a204888  # v4.1.3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:nix
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24  # v31.11.1
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Use the attic cache
+        env:
+          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
+        run: |
+          nix run --inputs-from . nixpkgs#attic-client -- login --set-default home https://attic.taile2777.ts.net "$ATTIC_TOKEN"
+          nix run --inputs-from . nixpkgs#attic-client -- use home
+      - name: Substitute the package and its dependencies from attic
+        run: |
+          # --max-jobs 0 and no remote builders: a derivation that attic does
+          # not serve fails here instead of being built locally.
+          for attr in cargo cargo-deps attic-client; do
+            nix build -L --max-jobs 0 --builders '' --option fallback false ".#$attr" --out-link "verify-$attr"
+          done
+          nix path-info --recursive ./verify-cargo | wc -l
+      - name: Run the substituted package
+        run: |
+          ./verify-cargo/bin/cargo -V | tee version.txt
+          grep -F "turtton/cargo $(cat TURTTON_VERSION)," version.txt
+          bash ci/smoke-installed.sh "$PWD/verify-cargo/bin/cargo"

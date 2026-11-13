@@ -88,6 +88,23 @@ cargo 1.101.0 (ea4e34c28 2026-10-29) (turtton/cargo 0.102.0-9-turtton.1, https:/
 `cargo +nightly` and `rust-toolchain.toml` keep working when rustup is
 installed next to it.
 
+## CI and releases
+
+- `ci.yml`: focused Linux checks (rustfmt, clippy, the library tests and the
+  fork's testsuite modules) on every pull request and push to `main`.
+- `nix.yml`: builds the Nix package for x86_64-linux and runs its install
+  check. A push to `main` or a `v*` tag also pushes the closures to the attic
+  cache and then substitutes them on a fresh runner. It needs the Actions
+  secrets `TS_OAUTH_CLIENT_ID`, `TS_OAUTH_SECRET` and `ATTIC_TOKEN`; without
+  them it builds and checks only. Pull requests from forks never get secrets.
+- `main.yml` ("Full testsuite"): the upstream suite on every OS, started by
+  hand or for a `release/**` branch or `v*` tag.
+- `audit.yml`: `cargo deny` for changes to a manifest or lockfile.
+
+No workflow creates a GitHub release or publishes a site: the upstream release
+and website workflows were removed. A release is a `v<TURTTON_VERSION>` tag
+(for example `v0.102.0-9-turtton.1`) that the maintainer pushes by hand.
+
 ## Results
 
 [nsh](https://github.com/longbridge/nsh), a 525-crate workspace, dev build of
