@@ -169,7 +169,8 @@ jobs:
         run: |
           # How the runner reaches attic (direct or DERP relay) bounds throughput.
           timeout 60 sudo tailscale ping -c 3 attic.taile2777.ts.net || true
-          ci/push-attic.sh result-attic result-cargo result-deps
+          # The leading ./ keeps the links from being read as flake references.
+          ci/push-attic.sh ./result-attic ./result-cargo ./result-deps
       # What verify-cache must find in attic: the roots of the pushed closures.
       - name: Record the push
         id: record
