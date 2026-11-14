@@ -64,6 +64,12 @@ echo "##[group]daemon"
 bash "$here/darwin-ci-verify-cache.sh" daemon
 echo "##[endgroup]"
 
-echo "== what the local cache was asked for"
-sed -E 's/^.*"(GET|HEAD) ([^ ]*) HTTP[^"]*" ([0-9]+).*$/\3 \1 \2/' "$work/http.log" | sort | uniq -c | sort -rn | head -50
+echo "== what the local cache was asked for (requests by status)"
+awk '
+  match($0, /" [0-9][0-9][0-9] /) { served[substr($0, RSTART + 2, 3)]++ }
+  / code 404, message / { missing++ }
+  END {
+    for (code in served) print served[code], "responses with status", code
+    print missing + 0, "404 error lines"
+  }' "$work/http.log"
 echo "rehearsal: OK"
