@@ -723,7 +723,18 @@ fn discover_gix_repo(root: &Path) -> CargoResult<Option<gix::Repository>> {
                     | gix::config::Source::Cli
                     | gix::config::Source::Api
                     | gix::config::Source::EnvOverride => repo.current_dir().join(path),
-                    _ => repo.path().join(path),
+                    _ => {
+                        let path = repo.path().join(path);
+                        // Resolve symlinks before interpreting `..`, but keep
+                        // logical paths when they name the same directory (for
+                        // example, a repository below a symlinked /tmp).
+                        let resolved = gix::path::realpath(&path)?;
+                        let same_directory =
+                            gix::path::normalize(path.as_path().into(), repo.current_dir())
+                                .and_then(|logical| gix::path::realpath(logical).ok())
+                                .is_some_and(|logical| logical == resolved);
+                        if same_directory { path } else { resolved }
+                    }
                 };
                 // Enumeration compares paths lexically, so .git/.. must not
                 // survive in the restored workdir.

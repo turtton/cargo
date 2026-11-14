@@ -350,6 +350,43 @@ fn git_worktree_config_self_disabling() {
 }
 
 #[cargo_test]
+fn git_worktree_config_symlinked_git_dir() {
+    if !cargo_test_support::symlink_supported() {
+        return;
+    }
+    let p = worktree_config_repo(true, Some("[core]\n\tbare = false\n\tworktree = ../..\n"));
+    fs::create_dir(p.root().join("metadata")).unwrap();
+    fs::rename(p.root().join(".git"), p.root().join("metadata/repo.git")).unwrap();
+    p.symlink("metadata/repo.git", ".git");
+    fs::write(p.root().join(".gitignore"), "ignored.txt\nmetadata/\n").unwrap();
+    git_is_bare(&p.root(), false).run();
+    assert_package_files(
+        &mut fork_cargo(&p, "package --list --allow-dirty"),
+        "src/lib.rs",
+    );
+    fork_cargo(&p, "build").run();
+    fork_cargo(&p, "check").run();
+}
+
+#[cargo_test]
+fn git_worktree_config_symlinked_ancestor() {
+    if !cargo_test_support::symlink_supported() {
+        return;
+    }
+    let p = worktree_config_repo(true, Some("[core]\n\tbare = false\n\tworktree = ..\n"));
+    let alias = paths::root().join("alias");
+    p.symlink(p.root(), &alias);
+    git_is_bare(&alias, false).run();
+    let manifest = alias.join("Cargo.toml");
+    assert_package_files(
+        fork_cargo(&p, "package --list --allow-dirty --manifest-path").arg(&manifest),
+        "src/lib.rs",
+    );
+    fork_cargo(&p, "build --manifest-path").arg(&manifest).run();
+    fork_cargo(&p, "check --manifest-path").arg(&manifest).run();
+}
+
+#[cargo_test]
 fn git_worktree_config_gitfile() {
     let p = worktree_config_repo(true, Some("[core]\n\tbare = false\n"));
     let git_dir = paths::root().join("separate.git");
