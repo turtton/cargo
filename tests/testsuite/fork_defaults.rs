@@ -161,7 +161,13 @@ fn gc_keeps_native_archive_of_build_script_under_pressure() {
                 fs::write(native.join(archive), b"!<arch>\n").unwrap();
                 fs::write(manifest.join("native-dir"), native.to_str().unwrap()).unwrap();
                 println!("cargo:rustc-link-search=native={}", native.display());
-                println!("cargo:rustc-link-lib=static=native_probe");
+                // link.exe rejects this placeholder archive (LNK1107), and
+                // writing a valid COFF archive is not worth it: what is
+                // tested is where the archive lives and that GC keeps it,
+                // not the link. Unix, where the fork ships, still links it.
+                if !cfg!(windows) {
+                    println!("cargo:rustc-link-lib=static=native_probe");
+                }
             }
             "#,
         )
