@@ -16,32 +16,13 @@
 # --no-check-sigs and --substitute-on-destination are not used, and a warning
 # that a setting was ignored fails the run.
 #
-# It runs under a bash and tools pinned to the nixpkgs revision of flake.lock,
-# not the runner's bash 3.2 and BSD tools (see the step in nix.yml):
-#
-#   rev=<the nixpkgs rev of flake.lock>; p=github:NixOS/nixpkgs/$rev
-#   NIXPKGS_REV=$rev VERIFY_NIX_BIN=$(dirname "$(command -v nix)") \
-#     nix shell $p#bash $p#coreutils $p#gnugrep $p#gnused $p#findutils $p#curl \
-#       -c bash nix/darwin-ci-verify.sh
+# It runs under the bash and tools of the nixpkgs revision of flake.lock, not the
+# runner's bash 3.2 and BSD tools: nix/run-pinned.sh nix/darwin-ci-verify.sh
 set -eo pipefail
 
-case "$BASH" in
-  /nix/store/*) ;;
-  *) echo "::error::run this script with the pinned bash (see nix.yml), not $BASH"; exit 1 ;;
-esac
-: "${NIXPKGS_REV:?the nixpkgs revision of flake.lock}"
-: "${VERIFY_NIX_BIN:?the directory of the nix of the runner}"
-# Only the pinned tools and the runner's nix (the client of its daemon).
-pinned="$(printf '%s' "$PATH" | tr ':' '\n' | grep '^/nix/store/' | paste -sd: -)"
-PATH="$pinned:$VERIFY_NIX_BIN"
-export PATH
-for tool in bash cat chmod curl grep head mkdir mktemp paste rm sed tee tr wc; do
-  found="$(command -v "$tool" || true)"
-  case "$found" in
-    /nix/store/*) ;;
-    *) echo "::error::$tool is not a pinned tool: '$found'"; exit 1 ;;
-  esac
-done
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=nix/pinned-env.sh
+source "$here/pinned-env.sh"
 
 UPSTREAM_URL=https://cache.nixos.org
 UPSTREAM_KEY=cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=

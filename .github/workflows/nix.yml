@@ -1,6 +1,5 @@
 # Builds the Nix package (x86_64-linux and aarch64-darwin), runs its install
-# check, and publishes the result (x86_64-linux) to the attic cache for trusted
-# events only.
+# check, and publishes the results to the attic cache for trusted events only.
 #
 #   pull_request            `build`: build + install check. No secret, no
 #                           Tailscale and no attic cache for any pull request,
@@ -10,7 +9,11 @@
 #                           uses the public substituters only.
 #                           `build-darwin` builds the same on macos-15 (aarch64-darwin)
 #                           with cache.nixos.org as the only substituter; it uses
-#                           no secret and no environment either.
+#                           no secret and no environment either. It also dry-runs
+#                           ci/push-attic.sh with a stub client, and
+#                           `verify-darwin-rehearsal` runs the checks of
+#                           `verify-cache-darwin` against a local cache that
+#                           stands in for attic.
 #   workflow_dispatch       `build`; never publishes.
 #   push to main, v* tag    `publish`: build + install check, then push the
 #                           closures to attic; `verify-cache` then substitutes
@@ -20,6 +23,11 @@
 #                           (its secrets TS_OAUTH_CLIENT_ID, TS_OAUTH_SECRET and
 #                           ATTIC_TOKEN), and the environment's deployment
 #                           branch/tag rules should allow `main` and `v*` only.
+#                           `publish-darwin` and `verify-cache-darwin` do the same
+#                           for aarch64-darwin on macos-15. They depend on each
+#                           other only, never on the Linux jobs, and the Linux
+#                           jobs do not wait for them; they use the same
+#                           environment and secrets.
 #
 # `publish` runs only Nix builds and the push: no script of the repository
 # touches the credentials outside the Nix sandbox, except ci/push-attic.sh,
@@ -134,15 +142,9 @@ jobs:
       # The checks of verify-cache that do not need attic, before the long builds.
       - name: Rehearse the signature checks of verify-cache with cache.nixos.org
         timeout-minutes: 15
-        run: |
-          # The tools are the ones of the nixpkgs revision in flake.lock, not
-          # the runner's bash 3.2 and BSD tools.
-          rev="$(nix eval --raw --impure --expr '(builtins.fromJSON (builtins.readFile ./flake.lock)).nodes.nixpkgs.locked.rev')"
-          echo "pinned nixpkgs: $rev"
-          p="github:NixOS/nixpkgs/$rev"
-          NIXPKGS_REV="$rev" VERIFY_NIX_BIN="$(dirname "$(command -v nix)")" \
-            nix shell "$p#bash" "$p#coreutils" "$p#gnugrep" "$p#gnused" "$p#findutils" "$p#curl" \
-            -c bash nix/darwin-ci-verify.sh
+        # The tools are the ones of the nixpkgs revision in flake.lock, not the
+        # runner's bash 3.2 and BSD tools.
+        run: nix/run-pinned.sh nix/darwin-ci-verify.sh
       - name: Build the dependencies
         timeout-minutes: 120
         run: |
@@ -190,6 +192,28 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: nix/darwin-ci-https.sh result-cargo/bin/cargo
+      # What publish-darwin does after its builds, up to the network: the data it
+      # hands to verify-cache-darwin, and ci/push-attic.sh with a stub client.
+      - name: Build the Mach-O allow lists
+        timeout-minutes: 10
+        run: nix build -L --option sandbox true .#checks.aarch64-darwin.macho-config --out-link result-macho 2>&1 | tee build-macho-config.log
+      - name: Dry-run ci/push-attic.sh with a stub attic client
+        timeout-minutes: 15
+        run: nix/run-pinned.sh nix/darwin-ci-push-dryrun.sh ./result-cargo ./result-deps
+      # The paths of the closures that cache.nixos.org does not have, as a signed
+      # binary cache, for verify-darwin-rehearsal on a fresh runner (this job's
+      # store has them all, which the daemon step of the verify script forbids).
+      - name: Export what attic would hold, signed with a key of this run
+        timeout-minutes: 30
+        run: nix/run-pinned.sh nix/darwin-ci-rehearsal-export.sh ./result-cargo ./result-deps ./result-macho "$RUNNER_TEMP/rehearsal"
+      - name: Upload the rehearsal cache
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: darwin-rehearsal-cache
+          path: ${{ runner.temp }}/rehearsal
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
       - name: No setting was ignored
         if: ${{ !cancelled() }}
         run: |
@@ -214,6 +238,44 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           df -h / /nix || true
+
+  # Pull requests and manual runs: the checks of verify-cache-darwin, run for
+  # real against a local cache that stands in for attic, on a fresh runner whose
+  # Nix store has none of the paths. build-darwin made the cache (the paths of
+  # the two closures that cache.nixos.org does not have, signed with a key of
+  # that run) and the data publish-darwin would hand over. No secret: the
+  # credential is a made-up token, and the cache is on 127.0.0.1. What this
+  # cannot show is the network to attic and the real credential, which only
+  # verify-cache-darwin on main can.
+  verify-darwin-rehearsal:
+    needs: build-darwin
+    if: github.event_name != 'push'
+    runs-on: macos-15
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24  # v31.11.1
+        with:
+          github_access_token: ${{ github.token }}
+          extra_nix_config: |
+            sandbox = true
+            substituters = https://cache.nixos.org
+            trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+            accept-flake-config = false
+      - name: Download the rehearsal cache
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: darwin-rehearsal-cache
+          path: ${{ runner.temp }}/rehearsal
+      - name: Verify the cache the way verify-cache-darwin does
+        timeout-minutes: 40
+        env:
+          PINNED_EXTRA_PACKAGES: python3
+        run: nix/run-pinned.sh nix/darwin-ci-rehearsal.sh "$RUNNER_TEMP/rehearsal"
 
   # Main and v* tags only: the code is already merged or tagged. This job
   # builds, checks (inside the Nix sandbox only) and pushes; it never executes
@@ -498,3 +560,223 @@ jobs:
           sudo env -i HOME=/tmp/home CARGO_HOME=/tmp/home/.cargo chroot "$store" "$CARGO_OUT/bin/cargo" -V | tee version.txt
           grep -F "turtton/cargo $RELEASE," version.txt
           ! grep -q huacnlee version.txt
+
+  # aarch64-darwin, main and v* tags only: what `publish` does on x86_64-linux,
+  # on macos-15, and independent of it (a failure of one does not stop the
+  # other, and the Linux jobs do not wait for this one). The builds run in the
+  # Nix sandbox with cache.nixos.org as the only substituter, and finish before
+  # Tailscale and the credential are put on the runner; the credential is read
+  # only by the steps that set up the attic client. The roots are cargo and
+  # cargo-deps. The unpatched attic client of the pinned nixpkgs is used (the
+  # TCP_USER_TIMEOUT patch is for Linux, where reqwest has that option).
+  #
+  # What it hands to verify-cache-darwin, as separate outputs of this system:
+  # the system, the commit, the release, the absolute store paths of the roots,
+  # the other paths of cargo's closure that the Mach-O check allows, the
+  # deployment target and the allow lists of nix/check-macho.sh.
+  publish-darwin:
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref_type == 'tag')
+    runs-on: macos-15
+    # Build steps are capped at 120 minutes and the attic push at 60.
+    timeout-minutes: 240
+    environment: attic-publish
+    permissions:
+      contents: read
+    outputs:
+      pushed: ${{ steps.record.outputs.pushed }}
+      system: ${{ steps.handover.outputs.system }}
+      commit: ${{ steps.handover.outputs.commit }}
+      release: ${{ steps.handover.outputs.release }}
+      cargo: ${{ steps.handover.outputs.cargo }}
+      cargo-deps: ${{ steps.handover.outputs.cargo-deps }}
+      allowed: ${{ steps.handover.outputs.allowed }}
+      deployment-target: ${{ steps.handover.outputs.deployment-target }}
+      macho: ${{ steps.handover.outputs.macho }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Tag matches TURTTON_VERSION
+        if: github.ref_type == 'tag'
+        run: test "$GITHUB_REF_NAME" = "v$(cat TURTTON_VERSION)"
+      - name: Decide whether the attic cache can be used
+        id: gate
+        env:
+          TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
+          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
+        run: |
+          if [ -n "$TS_OAUTH_CLIENT_ID" ] && [ -n "$TS_OAUTH_SECRET" ] && [ -n "$ATTIC_TOKEN" ]; then
+            echo "attic=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "attic=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::attic cache not used (secrets of the attic-publish environment are not set)"
+          fi
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24  # v31.11.1
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+          # As in build-darwin: the sandbox is asked for explicitly, only
+          # cache.nixos.org substitutes and the flake's nixConfig (the attic
+          # cache) is not accepted. Attic is not a substituter of this job.
+          extra_nix_config: |
+            sandbox = true
+            substituters = https://cache.nixos.org
+            trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+            accept-flake-config = false
+      - name: Record the runner and the Nix configuration
+        timeout-minutes: 10
+        run: nix/darwin-ci-environment.sh
+      - name: The Nix sandbox is on
+        timeout-minutes: 10
+        run: nix/darwin-ci-sandbox-probe.sh
+      # No `nix flake check --no-build` here: see the build job.
+      - name: Build the dependencies
+        timeout-minutes: 120
+        run: nix build -L --option sandbox true .#cargo-deps --out-link result-deps
+      # The package's install check runs in the Nix sandbox as part of this
+      # build: version, a minimal offline build and the Mach-O check.
+      - name: Build and check the package
+        timeout-minutes: 120
+        run: nix build -L --option sandbox true .#cargo --out-link result-cargo
+      # The fixtures the Mach-O check must reject, the finished store path run
+      # read-only in the Nix sandbox (the updater smoke, which may listen on
+      # 127.0.0.1), the closure of the package and the allow lists.
+      - name: Build the smoke, closure and Mach-O checks
+        timeout-minutes: 30
+        run: |
+          nix build -L --option sandbox true \
+            .#checks.aarch64-darwin.macho-inspection \
+            .#checks.aarch64-darwin.smoke \
+            .#checks.aarch64-darwin.closure --no-link
+          nix build -L --option sandbox true .#checks.aarch64-darwin.macho-config --out-link result-macho
+      - name: Build the attic client of the pinned nixpkgs
+        timeout-minutes: 60
+        run: |
+          rev="$(nix eval --raw --impure --expr '(builtins.fromJSON (builtins.readFile ./flake.lock)).nodes.nixpkgs.locked.rev')"
+          nix build -L --option sandbox true --out-link result-attic "github:NixOS/nixpkgs/$rev#attic-client"
+          ./result-attic/bin/attic --version
+      # Checked before the credential is on the runner. The outputs are written
+      # here and are valid whether or not the push happens (`pushed` says).
+      - name: Hand over the commit, the release and the store paths
+        id: handover
+        timeout-minutes: 10
+        run: |
+          HANDOVER_GITHUB_OUTPUT="$GITHUB_OUTPUT" nix/run-pinned.sh nix/darwin-ci-handover.sh ./result-cargo ./result-deps ./result-macho | tee handover.json
+      - name: Connect to Tailscale
+        if: steps.gate.outputs.attic == 'true'
+        uses: tailscale/github-action@780049a30b6ff5c378a9e7b389d15ece7a204888  # v4.1.3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:nix
+      # DNS, routing, TLS (the certificate is checked, nothing is disabled) and
+      # the credential, before the long push. The client keeps its login in
+      # the runner's home for the push.
+      - name: Check that attic is reachable and accepts the credential
+        if: steps.gate.outputs.attic == 'true'
+        timeout-minutes: 10
+        env:
+          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
+        run: |
+          host=attic.taile2777.ts.net
+          echo "== tailscale"
+          tailscale status || true
+          sudo -n tailscale ping -c 3 "$host" || true
+          echo "== DNS, route and TLS: an HTTPS request with verification on"
+          status=0
+          curl -sS -o /dev/null --max-time 30 \
+            -w 'HTTP %{http_code} from %{remote_ip}, certificate verification %{ssl_verify_result}\n' \
+            "https://$host/" || status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::error::https://$host/ is not reachable (curl exit $status: 6 DNS, 7 connect, 28 timeout, 35/51/60 TLS)"
+            scutil --dns | head -40 || true
+            exit 1
+          fi
+          echo "== the credential"
+          ./result-attic/bin/attic login --set-default home "https://$host" "$ATTIC_TOKEN"
+          ./result-attic/bin/attic cache info home | tee cache-info.txt
+          # The key that flake.nix and the verify jobs trust.
+          key="$(sed -n 's/.*"\(home:[^"]*\)".*/\1/p' flake.nix | head -n 1)"
+          grep -qF "$key" cache-info.txt || echo "::warning::the public key of the cache is not $key"
+      - name: Push to attic
+        id: push
+        if: steps.gate.outputs.attic == 'true'
+        timeout-minutes: 60
+        run: |
+          # How the runner reaches attic (direct or DERP relay) bounds throughput.
+          sudo -n tailscale ping -c 3 attic.taile2777.ts.net || true
+          # readlink -e and timeout --kill-after are the GNU ones of the pinned
+          # nixpkgs. The leading ./ keeps the links from being read as flake
+          # references. The roots are cargo and cargo-deps only.
+          ATTIC_BIN="$PWD/result-attic/bin/attic" nix/run-pinned.sh ci/push-attic.sh ./result-cargo ./result-deps
+      - name: Record the push
+        id: record
+        env:
+          PUSHED: ${{ steps.push.outcome == 'success' }}
+        run: echo "pushed=$PUSHED" >> "$GITHUB_OUTPUT"
+
+  # Fetches what `publish-darwin` pushed into an empty store, on another macOS
+  # runner (a new one, nothing restored: its Nix store has none of the paths),
+  # the way a user of the flake gets the package, and runs it. The steps are in
+  # nix/darwin-ci-verify-cache.sh; verify-darwin-rehearsal runs the same script
+  # against a local cache in every pull request. Substitution may use attic and
+  # cache.nixos.org and nothing else (the flake is never consulted), each trusted
+  # by its own key. The netrc file with the credential exists only between the
+  # fetch step and the step that removes it; the daemon step runs without it.
+  verify-cache-darwin:
+    needs: publish-darwin
+    if: needs.publish-darwin.outputs.pushed == 'true'
+    runs-on: macos-15
+    timeout-minutes: 60
+    environment: attic-publish
+    permissions:
+      contents: read
+    env:
+      # The same cache and key as nixConfig in flake.nix.
+      ATTIC_URL: https://attic.taile2777.ts.net/home
+      ATTIC_HOST: attic.taile2777.ts.net
+      ATTIC_KEY: home:00byWMpTTw/3xTntv8EF6LQmlWlR9RU5Tl0GVG5Vwn8=
+      # The upstream cache and its public key (the default of every Nix).
+      UPSTREAM_URL: https://cache.nixos.org
+      UPSTREAM_KEY: cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+      # What publish-darwin handed over.
+      VC_SYSTEM: ${{ needs.publish-darwin.outputs.system }}
+      VC_COMMIT: ${{ needs.publish-darwin.outputs.commit }}
+      VC_RELEASE: ${{ needs.publish-darwin.outputs.release }}
+      VC_CARGO: ${{ needs.publish-darwin.outputs.cargo }}
+      VC_DEPS: ${{ needs.publish-darwin.outputs.cargo-deps }}
+      VC_ALLOWED: ${{ needs.publish-darwin.outputs.allowed }}
+      VC_MINOS: ${{ needs.publish-darwin.outputs.deployment-target }}
+      VC_MACHO: ${{ needs.publish-darwin.outputs.macho }}
+    steps:
+      # The scripts of the commit that was published.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          ref: ${{ needs.publish-darwin.outputs.commit }}
+          persist-credentials: false
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@780049a30b6ff5c378a9e7b389d15ece7a204888  # v4.1.3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:nix
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24  # v31.11.1
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+          extra_nix_config: |
+            sandbox = true
+            substituters = https://cache.nixos.org
+            trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+            accept-flake-config = false
+      - name: Check what publish-darwin handed over
+        run: nix/run-pinned.sh nix/darwin-ci-verify-cache.sh handover
+      - name: Substitute the closures from attic and cache.nixos.org into an empty store
+        env:
+          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
+        run: nix/run-pinned.sh nix/darwin-ci-verify-cache.sh fetch
+      - name: Remove the attic credential
+        if: always()
+        run: rm -f "$RUNNER_TEMP/verify-cache/netrc"
+      # No secret is present from here on.
+      - name: Copy to the daemon, run the package and check it again
+        run: nix/run-pinned.sh nix/darwin-ci-verify-cache.sh daemon
