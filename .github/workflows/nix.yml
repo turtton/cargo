@@ -150,8 +150,10 @@ jobs:
           nix build -L --option sandbox true .#cargo-deps --out-link result-deps 2>&1 | tee build-deps.log
           echo "deps: $((SECONDS - start)) s" | tee -a "$RUNNER_TEMP/times.txt"
       # The package's install check runs in the Nix sandbox as part of this
-      # build: version, a minimal offline build, the Mach-O check, no
-      # self-update. It prints otool's output before it judges.
+      # build: version, a minimal offline build and the Mach-O check; it prints
+      # otool's output before it judges. It has no no-self-update check on
+      # Darwin: that updater smoke needs listeners, which only checks.smoke
+      # (built below) may use.
       - name: Build and check the package
         timeout-minutes: 120
         run: |

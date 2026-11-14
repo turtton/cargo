@@ -471,10 +471,12 @@
 
           checks = {
             # The package builds, and its install check passes (version,
-            # offline build, runtime libraries, no self-update).
+            # offline build, runtime libraries; on Linux also no self-update).
             inherit cargo;
             # The finished store path, run read-only the way a user has it:
-            # it must not try to update itself.
+            # it must not try to update itself. This is the updater smoke on
+            # every system; on Darwin it is the only place it runs, because
+            # only this derivation is allowed to listen.
             smoke =
               pkgs.runCommand "turtton-cargo-smoke"
                 (
