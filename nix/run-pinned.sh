@@ -35,5 +35,11 @@ for name in bash coreutils diffutils gnugrep gnused gawk findutils curl jq cctoo
   refs+=("github:NixOS/nixpkgs/$rev#$name")
 done
 
-NIXPKGS_REV="$rev" PINNED_NIX_BIN="$(dirname "$(command -v nix)")" \
+# Computed here: a failing command substitution in the prefix of `exec` would
+# not stop it.
+nix_path="$(command -v nix)" || { echo "::error::nix is not on PATH" >&2; exit 1; }
+nix_bin="$(dirname "$nix_path")"
+[ -x "$nix_bin/nix" ] || { echo "::error::$nix_bin/nix is not the nix command" >&2; exit 1; }
+
+NIXPKGS_REV="$rev" PINNED_NIX_BIN="$nix_bin" \
   exec nix shell "${refs[@]}" -c bash "$@"

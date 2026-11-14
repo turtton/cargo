@@ -27,7 +27,11 @@ esac
 }
 
 # Only the pinned tools and the runner's nix.
-pinned_path="$(printf '%s' "$PATH" | tr ':' '\n' | grep '^/nix/store/' | paste -sd: -)"
+pinned_path="$(printf '%s' "$PATH" | tr ':' '\n' | grep '^/nix/store/' | paste -sd: -)" || pinned_path=""
+[ -n "$pinned_path" ] || {
+  echo "::error::PATH holds no store directory: this is not nix shell of nix/run-pinned.sh"
+  exit 1
+}
 PATH="$pinned_path:$PINNED_NIX_BIN"
 export PATH
 

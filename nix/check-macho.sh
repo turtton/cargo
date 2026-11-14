@@ -60,6 +60,8 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
 in_closure() {
+  # An empty path (a failed store_root_of) is in no closure.
+  [ -n "$1" ] || return 1
   grep -qxF -- "$1" "$MACHO_ALLOWED_CLOSURE"
 }
 

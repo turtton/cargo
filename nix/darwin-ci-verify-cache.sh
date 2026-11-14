@@ -126,7 +126,7 @@ case "$mode" in
     attic_opts=(--option netrc-file "$netrc" --option trusted-public-keys "$ATTIC_KEY" --option substituters "$ATTIC_URL")
 
     echo "== the verify store starts empty"
-    test "$(nix path-info --all --store "$store_uri" | wc -l)" -eq 0
+    assert_store_empty "$store_uri"
 
     # The log names the cache of every path. The store has no derivation, so a
     # path that neither cache serves cannot be built instead (and builds are
@@ -137,6 +137,7 @@ case "$mode" in
 
     echo "== every path of the closures is there and its content is intact"
     nix path-info --store "$store_uri" --recursive "${roots[@]}" | sort -u | tee "$closure_file"
+    [ -s "$closure_file" ] || fail_ci "the verify store lists no path for the roots"
     wc -l < "$closure_file"
     while read -r p; do
       test -e "$store$p" || fail_ci "missing from the verify store: $p"
@@ -144,6 +145,7 @@ case "$mode" in
     nix store verify --store "$store_uri" --no-trust --recursive "${roots[@]}"
     echo "== nothing but those closures is in the store"
     nix path-info --all --store "$store_uri" | sort -u > "$work/all.txt"
+    [ -s "$work/all.txt" ] || fail_ci "the verify store lists no path"
     cmp "$closure_file" "$work/all.txt" || fail_ci "the store holds paths outside the closures"
     echo "== the closure of the package is the package and the allowed outputs"
     nix path-info --store "$store_uri" --recursive "$VC_CARGO" | sort -u > "$work/cargo-closure.txt"
@@ -181,16 +183,6 @@ case "$mode" in
     #   - a path that only cache.nixos.org has: attic alone must not serve it.
     #     This is what the attic client's skipping of upstream paths means, and
     #     why the check above needs cache.nixos.org at all.
-    # What Nix says of a path that the cache does not have depends on its version
-    # ("is not valid", or that no substituter can build the path); an error of
-    # the network, the TLS handshake or the credential is no proof of absence.
-    expect_missing() {
-      grep -Eq 'is not valid|no substituter that can build it|know how to build' "$1" \
-        || fail_ci "the fetch of $2 failed, but Nix does not say that the path is missing"
-      if grep -Eiq 'unable to download|HTTP error|could not resolve|connection (refused|reset)|timed out|certificate|unauthori[sz]ed|forbidden' "$1"; then
-        fail_ci "the fetch of $2 failed with a network or credential error, not for a missing path"
-      fi
-    }
     fail_to_copy() {
       local dest="$work/negative-store-$1" log="$work/negative-$1.log"
       mkdir -p "$dest"
@@ -243,17 +235,6 @@ case "$mode" in
     mapfile -t fork < "$work/fork.txt"
     store_args=(--store "$store_uri")
 
-    # `nix path-info` without substituters asks the daemon's store alone.
-    in_daemon() {
-      local out
-      if out="$(nix path-info --option substituters "" "$1" 2>&1)"; then
-        return 0
-      fi
-      case "$out" in
-        *'is not valid'*) return 1 ;;
-        *) fail_ci "could not ask the daemon about $1: $out" ;;
-      esac
-    }
     none_in_daemon() {
       local p
       for p in "${fork[@]}"; do
@@ -290,17 +271,10 @@ case "$mode" in
     done < "$closure_file"
 
     echo "== NAR hashes and references are the same in both stores"
-    describe() {
-      local p
-      while read -r p; do
-        printf '%s %s %s\n' "$p" "$(nix-store "$@" -q --hash "$p")" "$(nix-store "$@" -q --references "$p" | sort | paste -sd, -)"
-      done < "$closure_file"
-    }
-    describe "${store_args[@]}" > "$work/describe-verify.txt"
-    describe > "$work/describe-daemon.txt"
+    describe_store "$work/describe-verify.txt" "$closure_file" "${store_args[@]}"
+    describe_store "$work/describe-daemon.txt" "$closure_file"
     cat "$work/describe-daemon.txt"
-    [ "$(wc -l < "$work/describe-daemon.txt")" -eq "$(wc -l < "$closure_file")" ] || fail_ci "a path has no description"
-    cmp "$work/describe-verify.txt" "$work/describe-daemon.txt" || fail_ci "the daemon's paths differ from the verified ones"
+    compare_descriptions "$work/describe-verify.txt" "$work/describe-daemon.txt"
     echo "== the daemon's copies are intact, and attic's carry attic's signature"
     nix store verify --no-trust --recursive "${roots[@]}"
     nix store verify --no-contents --option trusted-public-keys "$ATTIC_KEY" "${fork[@]}"

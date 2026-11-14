@@ -145,6 +145,11 @@ jobs:
         # The tools are the ones of the nixpkgs revision in flake.lock, not the
         # runner's bash 3.2 and BSD tools.
         run: nix/run-pinned.sh nix/darwin-ci-verify.sh
+      # The helpers of the publish and verify scripts must fail when a query
+      # behind a check fails (nix/darwin-ci-lib-test.sh uses shims).
+      - name: Test that the verify helpers fail when a query fails
+        timeout-minutes: 10
+        run: nix/run-pinned.sh nix/darwin-ci-lib-test.sh
       - name: Build the dependencies
         timeout-minutes: 120
         run: |
@@ -697,6 +702,8 @@ jobs:
           ./result-attic/bin/attic cache info home | tee cache-info.txt
           # The key that flake.nix and the verify jobs trust.
           key="$(sed -n 's/.*"\(home:[^"]*\)".*/\1/p' flake.nix | head -n 1)"
+          # An empty key would match anything.
+          [[ "$key" =~ ^home:[A-Za-z0-9+/]+=*$ ]] || { echo "::error::no public key of the cache in flake.nix: '$key'"; exit 1; }
           grep -qF "$key" cache-info.txt || echo "::warning::the public key of the cache is not $key"
       - name: Push to attic
         id: push

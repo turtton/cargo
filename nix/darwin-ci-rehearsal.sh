@@ -37,18 +37,20 @@ for _ in $(seq 1 30); do
 done
 curl -fsS "http://127.0.0.1:$port/nix-cache-info"
 
-VC_SYSTEM="$(jq -r .system "$dir/handover.json")"
-VC_COMMIT="$(jq -r .commit "$dir/handover.json")"
-VC_RELEASE="$(jq -r .release "$dir/handover.json")"
-VC_CARGO="$(jq -r .cargo "$dir/handover.json")"
-VC_DEPS="$(jq -r '."cargo-deps"' "$dir/handover.json")"
-VC_ALLOWED="$(jq -r .allowed "$dir/handover.json")"
-VC_MINOS="$(jq -r '."deployment-target"' "$dir/handover.json")"
-VC_MACHO="$(jq -c .macho "$dir/handover.json")"
+# jq -e: a missing key (null) is a failure, not the string "null".
+VC_SYSTEM="$(jq -er .system "$dir/handover.json")"
+VC_COMMIT="$(jq -er .commit "$dir/handover.json")"
+VC_RELEASE="$(jq -er .release "$dir/handover.json")"
+VC_CARGO="$(jq -er .cargo "$dir/handover.json")"
+VC_DEPS="$(jq -er '."cargo-deps"' "$dir/handover.json")"
+VC_ALLOWED="$(jq -er .allowed "$dir/handover.json")"
+VC_MINOS="$(jq -er '."deployment-target"' "$dir/handover.json")"
+VC_MACHO="$(jq -ec .macho "$dir/handover.json")"
 export VC_SYSTEM VC_COMMIT VC_RELEASE VC_CARGO VC_DEPS VC_ALLOWED VC_MINOS VC_MACHO
 export ATTIC_URL="http://127.0.0.1:$port"
 export ATTIC_HOST=127.0.0.1
 ATTIC_KEY="$(cat "$dir/pub.key")"
+[[ "$ATTIC_KEY" =~ ^[A-Za-z0-9._-]+:[A-Za-z0-9+/]+=*$ ]] || fail_ci "$dir/pub.key is not a public key: $ATTIC_KEY"
 export ATTIC_KEY
 export UPSTREAM_URL=https://cache.nixos.org
 export UPSTREAM_KEY=cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=

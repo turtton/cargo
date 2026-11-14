@@ -57,7 +57,9 @@ fi
 # The closure of the package is the package and the allowed outputs, nothing
 # else (checks.<darwin>.closure fails otherwise).
 closure="$(nix path-info --recursive "$cargo" | sort -u)"
-allowed="$(printf '%s\n' "$closure" | grep -vxF "$cargo" || true)"
+rc=0
+allowed="$(printf '%s\n' "$closure" | grep -vxF "$cargo")" || rc=$?
+[ "$rc" -le 1 ] || fail_ci "grep failed on the closure of $cargo"
 [ -n "$allowed" ] || fail_ci "the closure of $cargo has no other path: the analysis found nothing"
 while IFS= read -r p; do
   [[ "$p" =~ $store_path_re ]] || fail_ci "not an absolute store path in the closure: $p"
@@ -72,7 +74,9 @@ jq -e '
   and (.requiredDeps | length > 0) and (.forbiddenDeps | length > 0)
   and ([.systemLibs[], .transitiveSystemLibs[]] | all(startswith("/")))
 ' "$macho_file" > /dev/null || fail_ci "$macho_file is not a usable allow list"
-minos="$(jq -r .minos "$macho_file")"
+minos="$(jq -r .minos "$macho_file")" || fail_ci "could not read the deployment target of $macho_file"
+allowed_line="$(printf '%s\n' "$allowed" | paste -sd' ' -)" || fail_ci "could not join the allowed paths"
+[ -n "$allowed_line" ] || fail_ci "the allowed paths vanished"
 
 handover="$(jq -n \
   --arg system "$system" \
@@ -80,7 +84,7 @@ handover="$(jq -n \
   --arg release "$release" \
   --arg cargo "$cargo" \
   --arg deps "$deps" \
-  --arg allowed "$(printf '%s\n' "$allowed" | paste -sd' ' -)" \
+  --arg allowed "$allowed_line" \
   --arg minos "$minos" \
   --slurpfile macho "$macho_file" \
   '{system: $system, commit: $commit, release: $release, cargo: $cargo, "cargo-deps": $deps,

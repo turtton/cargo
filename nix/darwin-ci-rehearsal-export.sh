@@ -30,8 +30,10 @@ mkdir -p "$out/cache"
 
 bash "$here/darwin-ci-handover.sh" "$cargo_link" "$deps_link" "$macho_link" > "$out/handover.json"
 jq . "$out/handover.json"
-cargo="$(jq -r .cargo "$out/handover.json")"
-deps="$(jq -r '."cargo-deps"' "$out/handover.json")"
+cargo="$(jq -er .cargo "$out/handover.json")"
+deps="$(jq -er '."cargo-deps"' "$out/handover.json")"
+[[ "$cargo" =~ $store_path_re ]] || fail_ci "not an absolute store path: $cargo"
+[[ "$deps" =~ $store_path_re ]] || fail_ci "not an absolute store path: $deps"
 
 nix path-info --recursive "$cargo" "$deps" | sort -u > "$work/closure.txt"
 echo "closure: $(wc -l < "$work/closure.txt") paths"
