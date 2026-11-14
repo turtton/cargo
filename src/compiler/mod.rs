@@ -439,10 +439,12 @@ fn rustc(
     }
     let env_config = Arc::clone(build_runner.bcx.gctx.env_config()?);
     return Ok(Work::new(move |state| {
-        // Artifacts are in a different location than typical units,
-        // hence we must assure the crate- and target-dependent
-        // directory is present.
-        if artifact.is_true() {
+        // Artifact dependencies and build scripts can compile outside the
+        // pre-created deps directory. In particular, the legacy build-script
+        // directory is needed to compile the script, before its run job can
+        // create OUT_DIR. Prepare it here under the writer/coarse build lock,
+        // not during planning or only when executing the compiled script.
+        if artifact.is_true() || target.is_custom_build() {
             paths::create_dir_all(&root)?;
         }
 
