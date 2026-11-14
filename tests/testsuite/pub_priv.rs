@@ -630,12 +630,17 @@ fn verify_mix_cargo_feature_z() {
     p.cargo("check --message-format=short")
         .arg("-Zpublic-dependency")
         .masquerade_as_nightly_cargo(&["public-dependency"])
-        .with_stderr_data(str![[r#"
+        // The order rustc reports these two lints in depends on the paths of
+        // the environment, so it must not be asserted.
+        .with_stderr_data(
+            str![[r#"
 ...
 src/lib.rs:5:13: [WARNING] type `FromDep` from private dependency 'dep' in public interface
 src/lib.rs:6:13: [WARNING] type `FromPriv` from private dependency 'priv_dep' in public interface
 ...
-"#]])
+"#]]
+            .unordered(),
+        )
         .run();
 }
 
