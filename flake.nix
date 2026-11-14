@@ -230,13 +230,15 @@
           darwinAllowedStoreLibs = map lib.getLib darwinRuntimeLibs;
           # Their closure: what the binary and those libraries may name or load.
           darwinAllowedClosure = pkgs.closureInfo { rootPaths = darwinAllowedStoreLibs; };
-          # Candidate allow list; the diagnostic run of the first pull request
-          # decides it from the actual output of `otool -L`.
+          # What `otool -L` of the binary shows on macos-15 (the install check
+          # prints it): libSystem, libobjc and three frameworks. Nothing else
+          # of the system, and no Homebrew, build directory or SDK path.
           darwinSystemPrefixes = [
-            "/usr/lib/"
-            "/System/Library/Frameworks/CoreFoundation.framework/"
-            "/System/Library/Frameworks/Security.framework/"
-            "/System/Library/Frameworks/SystemConfiguration.framework/"
+            "/usr/lib/libSystem.B.dylib"
+            "/usr/lib/libobjc.A.dylib"
+            "/System/Library/Frameworks/CoreFoundation.framework/Versions/"
+            "/System/Library/Frameworks/Foundation.framework/Versions/"
+            "/System/Library/Frameworks/Security.framework/Versions/"
           ];
           # The store libraries (libcurl's own dependencies) may use any
           # system framework.

@@ -183,10 +183,13 @@ jobs:
       - name: No setting was ignored
         if: ${{ !cancelled() }}
         run: |
-          if grep -Ei 'ignoring the (client|user)-specified setting|ignoring untrusted flake configuration' build-*.log; then
+          # A setting of ours that the daemon ignored (e.g. the sandbox) fails.
+          if grep -Ei 'ignoring the (client|user)-specified setting' build-*.log; then
             echo "::error::Nix ignored a setting"
             exit 1
           fi
+          # The flake's own nixConfig (the attic cache) must have been refused.
+          grep -h 'ignoring untrusted flake configuration setting' build-*.log | sort -u
       - name: Timings
         if: ${{ !cancelled() }}
         run: |

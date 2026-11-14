@@ -22,12 +22,12 @@ set -eo pipefail
 UPSTREAM_URL=https://cache.nixos.org
 UPSTREAM_KEY=cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
 work="$(mktemp -d "${RUNNER_TEMP:-/tmp}/verify-rehearsal.XXXXXX")"
-trap 'rm -rf "$work"' EXIT
+trap 'chmod -R u+w "$work" 2> /dev/null; rm -rf "$work"' EXIT
 
 no_ignored_setting() {
-  if grep -Eiq 'ignoring the (client|user)-specified setting|unknown setting|ignoring untrusted' "$1"; then
+  if grep -Eiq 'ignoring the (client|user)-specified setting|unknown setting' "$1"; then
     echo "::error::Nix reported an ignored setting:"
-    grep -Ei 'ignoring the (client|user)-specified setting|unknown setting|ignoring untrusted' "$1"
+    grep -Ei 'ignoring the (client|user)-specified setting|unknown setting' "$1"
     exit 1
   fi
 }
