@@ -213,9 +213,14 @@
 
           '';
 
-          installCheckTail = ''
+          # The updater smoke starts listeners on 127.0.0.1. Linux runs it here;
+          # on Darwin, whose sandbox denies local networking, it is
+          # checks.smoke, the one derivation that is allowed to listen.
+          installCheckSmoke = ''
             echo "== no self-update (installed as \$CARGO_HOME/bin/cargo, every old switch set)"
             bash ci/smoke-installed.sh "$cargo_bin"
+          '';
+          installCheckEnd = ''
             runHook postInstallCheck
           '';
 
@@ -230,28 +235,29 @@
           darwinAllowedStoreLibs = map lib.getLib darwinRuntimeLibs;
           # Their closure: what the binary and those libraries may name or load.
           darwinAllowedClosure = pkgs.closureInfo { rootPaths = darwinAllowedStoreLibs; };
-          # What `otool -L` of the binary shows on macos-15 (the install check
-          # prints it): libSystem, libobjc and three frameworks. Nothing else
-          # of the system, and no Homebrew, build directory or SDK path.
-          darwinSystemPrefixes = [
+          # The install names `otool -L` shows on macos-15 (the install check
+          # prints them), in full: libSystem, libobjc and three frameworks for
+          # the binary. Nothing else of the system, and no Homebrew, build
+          # directory or SDK path.
+          darwinSystemLibs = [
             "/usr/lib/libSystem.B.dylib"
             "/usr/lib/libobjc.A.dylib"
-            "/System/Library/Frameworks/CoreFoundation.framework/Versions/"
-            "/System/Library/Frameworks/Foundation.framework/Versions/"
-            "/System/Library/Frameworks/Security.framework/Versions/"
+            "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation"
+            "/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation"
+            "/System/Library/Frameworks/Security.framework/Versions/A/Security"
           ];
           # What the store libraries load (libcurl, libkrb5: the same run
           # shows it): libSystem and four frameworks.
-          darwinTransitivePrefixes = [
+          darwinTransitiveSystemLibs = [
             "/usr/lib/libSystem.B.dylib"
-            "/System/Library/Frameworks/CoreFoundation.framework/Versions/"
-            "/System/Library/Frameworks/CoreServices.framework/Versions/"
-            "/System/Library/Frameworks/SystemConfiguration.framework/Versions/"
-            "/System/Library/Frameworks/Kerberos.framework/Versions/"
+            "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation"
+            "/System/Library/Frameworks/CoreServices.framework/Versions/A/CoreServices"
+            "/System/Library/Frameworks/SystemConfiguration.framework/Versions/A/SystemConfiguration"
+            "/System/Library/Frameworks/Kerberos.framework/Versions/A/Kerberos"
           ];
           machoEnv = ''
-            export MACHO_ALLOWED_PREFIXES="${lib.concatStringsSep " " darwinSystemPrefixes}"
-            export MACHO_TRANSITIVE_PREFIXES="${lib.concatStringsSep " " darwinTransitivePrefixes}"
+            export MACHO_ALLOWED_SYSTEM_LIBS="${lib.concatStringsSep " " darwinSystemLibs}"
+            export MACHO_TRANSITIVE_SYSTEM_LIBS="${lib.concatStringsSep " " darwinTransitiveSystemLibs}"
             export MACHO_ALLOWED_CLOSURE="${darwinAllowedClosure}/store-paths"
             export MACHO_MINOS="${darwinMinVersion}"
           '';
@@ -259,10 +265,10 @@
             echo "== Mach-O: arm64, macOS ${darwinMinVersion}, system libraries and the allowed outputs only"
             ${machoEnv}
             export MACHO_SELF_OUT="$out"
-            # libcurl is the one system library cargo links (all-static does not
-            # make it static on macOS); the OpenSSL of the store never is a
-            # direct dependency, it is vendored.
-            export MACHO_REQUIRED_DEPS='/libcurl[.0-9]*dylib$'
+            # libcurl (all-static does not make it static on macOS) and libiconv
+            # are the store libraries cargo links; the OpenSSL of the store
+            # never is a direct dependency, it is vendored.
+            export MACHO_REQUIRED_DEPS='^/nix/store/[^/]+/lib/libcurl[.0-9]*dylib$ ^/nix/store/[^/]+/lib/libiconv[.0-9]*dylib$'
             export MACHO_FORBIDDEN_DEPS='/lib(ssl|crypto)[.0-9]*dylib$'
             export MACHO_VERBOSE=1
             bash ${./nix/check-macho.sh} "$cargo_bin"
@@ -281,19 +287,16 @@
               ]
               ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.binutils ];
               installCheckPhase =
-                installCheckHead + (if isDarwin then darwinLinkCheck else linuxLinkCheck) + installCheckTail;
+                if isDarwin then
+                  installCheckHead + darwinLinkCheck + installCheckEnd
+                else
+                  installCheckHead + linuxLinkCheck + installCheckSmoke + installCheckEnd;
               meta = {
                 description = "turtton/cargo: Cargo with a shared build directory";
                 homepage = "https://github.com/turtton/cargo";
                 mainProgram = "cargo";
                 platforms = systems;
               };
-            }
-            // lib.optionalAttrs isDarwin {
-              # The install check starts listeners (ci/smoke-installed.sh) on
-              # 127.0.0.1, which the Darwin sandbox denies by default. The
-              # dependencies, built apart, do not get this.
-              __darwinAllowLocalNetworking = true;
             }
           );
 
@@ -417,6 +420,23 @@
                 reject unresolved-rpath rpath uses-rpath
                 cc usefoo.c libfoo-rpath.dylib -o uses-rpath-none
                 reject rpath-without-rpath dep-disallowed uses-rpath-none
+                # Paths that only look like an allowed place: a . or .. component
+                # climbs out of it, which a string comparison does not see.
+                cc -dynamiclib foo.c -install_name /System/Library/Frameworks/Security.framework/Versions/A/../../../../../../opt/homebrew/lib/libfoo.dylib -o libfoo-dotdot-system.dylib
+                cc usefoo.c libfoo-dotdot-system.dylib -o uses-dotdot-system
+                reject dotdot-in-system-path dep-disallowed uses-dotdot-system
+                cc -dynamiclib foo.c -install_name "$curlLib/lib/../../../tmp/libfoo.dylib" -o libfoo-dotdot-store.dylib
+                cc usefoo.c libfoo-dotdot-store.dylib -o uses-dotdot-store
+                reject dotdot-in-store-path dep-disallowed uses-dotdot-store
+                cc -dynamiclib foo.c -install_name /usr/lib/./libSystem.B.dylib -o libfoo-dot-system.dylib
+                cc usefoo.c libfoo-dot-system.dylib -o uses-dot-system
+                reject dot-in-system-path dep-disallowed uses-dot-system
+                cc good.c -Wl,-rpath,"$curlLib/lib/../../.." -o rpath-store-dotdot
+                reject dotdot-in-store-rpath rpath rpath-store-dotdot
+                # A system library that is not on the list, though under /usr/lib.
+                cc -dynamiclib foo.c -install_name /usr/lib/libz.1.dylib -o libfoo-usrlib.dylib
+                cc usefoo.c libfoo-usrlib.dylib -o uses-usrlib
+                reject unlisted-system-library dep-disallowed uses-usrlib
                 # A store library the allowed outputs do not need.
                 ! grep -q -- '-bzip2-' "$MACHO_ALLOWED_CLOSURE"
                 echo 'const char *BZ2_bzlibVersion(void); int main(void) { return BZ2_bzlibVersion() == 0; }' > bz2.c
@@ -460,7 +480,9 @@
                 (
                   { nativeBuildInputs = [ pkgs.python3 ]; }
                   // lib.optionalAttrs isDarwin {
-                    # The listeners of ci/smoke-installed.sh, as in the install check.
+                    # The updater smoke starts listeners (ci/smoke-installed.sh) on
+                    # 127.0.0.1, which the Darwin sandbox denies by default. Only
+                    # this derivation, which builds nothing, may listen.
                     __darwinAllowLocalNetworking = true;
                   }
                 )

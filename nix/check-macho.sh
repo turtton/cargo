@@ -8,7 +8,8 @@
 # It checks that the binary
 #   - is a thin arm64 Mach-O,
 #   - targets exactly macOS $MACHO_MINOS (LC_BUILD_VERSION minos),
-#   - links dynamically only to system libraries ($MACHO_ALLOWED_PREFIXES) and
+#   - links dynamically only to the system libraries named in full in
+#     $MACHO_ALLOWED_SYSTEM_LIBS and
 #     to the store outputs whose closure is listed in $MACHO_ALLOWED_CLOSURE,
 #     and so do all those store libraries, transitively,
 #   - has LC_RPATH entries only in those places, and every @rpath/ dependency
@@ -18,9 +19,14 @@
 # Anything it cannot parse, and an empty result, is a failure. Failures are
 # reported as `macho-check: <tag>: <message>` on stderr and exit status 1.
 #
-#   MACHO_ALLOWED_PREFIXES    space-separated path prefixes of system libraries
-#   MACHO_TRANSITIVE_PREFIXES same for the libraries of the store outputs
-#                             (default: MACHO_ALLOWED_PREFIXES)
+#   MACHO_ALLOWED_SYSTEM_LIBS space-separated install names of the system libraries
+#                             the binary may load, each in full
+#   MACHO_TRANSITIVE_SYSTEM_LIBS same for the libraries of the store outputs
+#                             (default: MACHO_ALLOWED_SYSTEM_LIBS)
+#
+# A path is never normalized by the check, so none that contains a `.` or `..`
+# component, or an empty one (`//`), is accepted anywhere: it could name a place
+# outside the one a string comparison saw.
 #   MACHO_ALLOWED_CLOSURE     file listing the allowed store paths (closure)
 #   MACHO_SELF_OUT            the store path the binary is installed to
 #   MACHO_MINOS               the deployment target, e.g. 14.0
@@ -37,11 +43,11 @@ fail() {
 }
 
 bin="${1:?usage: check-macho.sh BINARY}"
-: "${MACHO_ALLOWED_PREFIXES:?}"
+: "${MACHO_ALLOWED_SYSTEM_LIBS:?}"
 : "${MACHO_ALLOWED_CLOSURE:?}"
 : "${MACHO_SELF_OUT:?}"
 : "${MACHO_MINOS:?}"
-transitive_prefixes="${MACHO_TRANSITIVE_PREFIXES:-$MACHO_ALLOWED_PREFIXES}"
+transitive_libs="${MACHO_TRANSITIVE_SYSTEM_LIBS:-$MACHO_ALLOWED_SYSTEM_LIBS}"
 required="${MACHO_REQUIRED_DEPS:-}"
 forbidden="${MACHO_FORBIDDEN_DEPS:-}"
 denied="${MACHO_DENIED_NAMES:-apple-sdk|clang|llvm|cctools|cc-wrapper|bintools|stdenv|xcbuild|bootstrap|rustc|rust-1|crane}"
@@ -61,14 +67,21 @@ store_root_of() {
   printf '%s\n' "$1" | sed -E 's#^(/nix/store/[^/]+).*#\1#'
 }
 
-has_prefix() {
-  local path="$1" prefixes="$2" p
-  for p in $prefixes; do
-    case "$path" in
-      "$p"*) return 0 ;;
-    esac
+# Succeeds when $1 is exactly one of the words of $2.
+is_listed() {
+  local path="$1" libs="$2" l
+  for l in $libs; do
+    [ "$path" = "$l" ] && return 0
   done
   return 1
+}
+
+# Fails for a path with a `.` or `..` component or an empty one.
+is_plain_path() {
+  case "$1" in
+    *//* | */./* | */. | */../* | */..) return 1 ;;
+  esac
+  return 0
 }
 
 # Mach-O thin arm64 header of $1.
@@ -106,27 +119,27 @@ deps_of() {
   esac | sed -E 's/^[[:space:]]+//; s/ \(compatibility version.*$//' | grep -v '^$' || true
 }
 
-# Checks the rpaths of $1 ($2 is its `otool -l`), allowing $3 as system prefixes.
+# Checks the rpaths of $1 ($2 is its `otool -l`): only directories of the
+# allowed store outputs.
 check_rpaths() {
-  local f="$1" lc="$2" prefixes="$3" r
+  local f="$1" lc="$2" r
   rpaths_in "$lc" | while IFS= read -r r; do
+    is_plain_path "$r" || fail rpath "$f has an LC_RPATH with a . or .. component: $r"
     case "$r" in
       /nix/store/*)
         in_closure "$(store_root_of "$r")" || fail rpath "$f has an LC_RPATH outside the allowed outputs: $r"
         ;;
-      /*)
-        has_prefix "$r/" "$prefixes" || fail rpath "$f has an LC_RPATH outside the allowed places: $r"
-        ;;
-      *) fail rpath "$f has a relative or loader-relative LC_RPATH: $r" ;;
+      *) fail rpath "$f has an LC_RPATH that is not in an allowed output: $r" ;;
     esac
   done
 }
 
 # Checks dependency $2 of file $1 ($3 is the file's `otool -l`) against the
-# prefixes $4. A dependency in the store prints its path on stdout so that the
+# system libraries $4. A dependency in the store prints its path on stdout so that the
 # caller can inspect it in turn.
 check_dep() {
-  local f="$1" dep="$2" lc="$3" prefixes="$4" r rest cand found=""
+  local f="$1" dep="$2" lc="$3" syslibs="$4" r rest cand found=""
+  is_plain_path "$dep" || fail dep-disallowed "$f: dependency $dep has a . or .. component"
   case "$dep" in
     @rpath/*)
       rest="${dep#@rpath/}"
@@ -150,7 +163,7 @@ check_dep() {
       printf '%s\n' "$dep"
       ;;
     /*)
-      has_prefix "$dep" "$prefixes" || fail dep-disallowed "$f: dependency $dep is not an allowed system library"
+      is_listed "$dep" "$syslibs" || fail dep-disallowed "$f: dependency $dep is not an allowed system library"
       ;;
     *) fail dep-disallowed "$f: dependency $dep is not an absolute path" ;;
   esac
@@ -193,7 +206,7 @@ for re in $forbidden; do
     fail forbidden-dep "a direct dependency matches $re"
   fi
 done
-check_rpaths "$bin" "$lc" "$MACHO_ALLOWED_PREFIXES"
+check_rpaths "$bin" "$lc"
 : > "$tmp/work"
 : > "$tmp/seen"
 queue() {
@@ -203,7 +216,7 @@ queue() {
   }
 }
 while IFS= read -r dep; do
-  resolved="$(check_dep "$bin" "$dep" "$lc" "$MACHO_ALLOWED_PREFIXES")"
+  resolved="$(check_dep "$bin" "$dep" "$lc" "$MACHO_ALLOWED_SYSTEM_LIBS")"
   if [ -n "$resolved" ]; then
     queue "$resolved"
   fi
@@ -224,9 +237,9 @@ while :; do
   fdeps="$(deps_of "$f")"
   [ -n "$fdeps" ] || fail deps-empty "$f has no dependency: the analysis found nothing"
   printf '%s\n' "$fdeps" | sed 's/^/   dep: /'
-  check_rpaths "$f" "$flc" "$transitive_prefixes"
+  check_rpaths "$f" "$flc"
   while IFS= read -r dep; do
-    resolved="$(check_dep "$f" "$dep" "$flc" "$transitive_prefixes")"
+    resolved="$(check_dep "$f" "$dep" "$flc" "$transitive_libs")"
     if [ -n "$resolved" ]; then
       queue "$resolved"
     fi

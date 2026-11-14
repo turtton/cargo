@@ -100,7 +100,7 @@ Linux one in two ways that matter at run time:
   `all-static` feature does not make curl static on macOS.
 - TLS verification stays on, and that libcurl does not use the system keychain.
   It reads a CA file through its OpenSSL, and `cargo fetch` works as is on
-  macOS 15 with no CA setting at all (CI checks it). A CA you added to the
+  macOS 15 with no CA setting at all (CI records that it does). A CA you added to the
   keychain only, such as a corporate proxy's, is not in that default bundle.
   Point cargo at a bundle that has it:
 

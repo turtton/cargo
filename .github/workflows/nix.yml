@@ -134,7 +134,15 @@ jobs:
       # The checks of verify-cache that do not need attic, before the long builds.
       - name: Rehearse the signature checks of verify-cache with cache.nixos.org
         timeout-minutes: 15
-        run: nix/darwin-ci-verify.sh
+        run: |
+          # The tools are the ones of the nixpkgs revision in flake.lock, not
+          # the runner's bash 3.2 and BSD tools.
+          rev="$(nix eval --raw --impure --expr '(builtins.fromJSON (builtins.readFile ./flake.lock)).nodes.nixpkgs.locked.rev')"
+          echo "pinned nixpkgs: $rev"
+          p="github:NixOS/nixpkgs/$rev"
+          NIXPKGS_REV="$rev" VERIFY_NIX_BIN="$(dirname "$(command -v nix)")" \
+            nix shell "$p#bash" "$p#coreutils" "$p#gnugrep" "$p#gnused" "$p#findutils" "$p#curl" \
+            -c bash nix/darwin-ci-verify.sh
       - name: Build the dependencies
         timeout-minutes: 120
         run: |
