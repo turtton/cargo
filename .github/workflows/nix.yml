@@ -270,17 +270,28 @@ jobs:
           # What cache.nixos.org does not have only attic can have served, and
           # attic must have each of those paths.
           echo "== which paths of the closures cache.nixos.org has"
+          # Asks for the narinfo itself. `nix path-info` says "is not valid" for
+          # an HTTP 401/403 as well as for a 404, so only the status can tell
+          # a path the cache does not have from a query that failed. Only a
+          # 404 means "not there"; a 200 must be the narinfo of this very path;
+          # every other answer (403, 5xx, no connection) is an error.
           probe_upstream() {
-            local err
-            # Only that cache answers: no other substituter (the runner's, or
-            # a flake's) may supply the path to the query.
-            if err="$(nix path-info --store "$UPSTREAM_URL" --option substituters '' "$1" 2>&1 >/dev/null)"; then
-              printf 'upstream %s\n' "$1"
-            elif [[ "$err" == *"is not valid"* ]]; then
-              printf 'fork %s\n' "$1"
+            local path="$1" name hash body code err
+            name="${path#/nix/store/}"
+            hash="${name%%-*}"
+            body="$(mktemp "$RUNNER_TEMP/narinfo.XXXXXX")"
+            if ! code="$(curl -sS --retry 5 --retry-delay 2 --retry-all-errors --connect-timeout 10 --max-time 60 \
+              -o "$body" -w '%{http_code}' "$UPSTREAM_URL/$hash.narinfo" 2>"$body.err")"; then
+              err="$(tr '\n' ' ' < "$body.err")"
+              printf 'error %s: %s\n' "$path" "$err"
+            elif [ "$code" = 404 ]; then
+              printf 'fork %s\n' "$path"
+            elif [ "$code" = 200 ] && grep -qxF "StorePath: $path" "$body"; then
+              printf 'upstream %s\n' "$path"
             else
-              printf 'error %s: %s\n' "$1" "${err//$'\n'/ }"
+              printf 'error %s: HTTP %s from %s/%s.narinfo\n' "$path" "$code" "$UPSTREAM_URL" "$hash"
             fi
+            rm -f "$body" "$body.err"
           }
           export -f probe_upstream
           export UPSTREAM_URL
