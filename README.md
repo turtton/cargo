@@ -61,7 +61,7 @@ nix profile install github:turtton/cargo
 
 Or add it to a flake (`inputs.turtton-cargo.url = "github:turtton/cargo";`) and
 use `inputs.turtton-cargo.packages.${system}.cargo`. Pin a revision with
-`github:turtton/cargo/<commit>`. Only `x86_64-linux` is built today.
+`github:turtton/cargo/<commit>`. `x86_64-linux` and `aarch64-darwin` are built.
 
 The flake's `nixConfig` lists a binary cache (attic) so that a build you have
 not done yourself is fetched, not compiled. Nix asks before trusting it unless
@@ -88,12 +88,36 @@ cargo 1.101.0 (ea4e34c28 2026-10-29) (turtton/cargo 0.102.0-9-turtton.2, https:/
 `cargo +nightly` and `rust-toolchain.toml` keep working when rustup is
 installed next to it.
 
+### macOS (aarch64-darwin)
+
+The package targets macOS 14 or later on Apple silicon. It differs from the
+Linux one in two ways that matter at run time:
+
+- It links nixpkgs' libcurl dynamically (`curlMinimal`, a store output that
+  comes with the package's closure) next to the system libraries and
+  frameworks; OpenSSL, libgit2 and SQLite are built in. The upstream
+  `all-static` feature does not make curl static on macOS.
+- That libcurl has no CA bundle compiled in, and the system keychain is not
+  used. HTTPS verification stays on, so cargo needs to be told which CA file to
+  trust, as with any Nix-built curl. If `cargo fetch` fails with "SSL
+  certificate problem", set one of
+
+  ```sh
+  export SSL_CERT_FILE=/etc/ssl/cert.pem          # the system's bundle, or
+  export SSL_CERT_FILE=$NIX_SSL_CERT_FILE         # the CA file of your Nix setup
+  export CARGO_HTTP_CAINFO=/path/to/ca-bundle.crt # cargo's own setting
+  ```
+
+  or `[http] cainfo = "..."` in `~/.cargo/config.toml`. Verification is never
+  turned off by the package.
+
 ## CI and releases
 
 - `ci.yml`: focused Linux checks (rustfmt, clippy, the library tests and the
   fork's testsuite modules) on every pull request and push to `main`.
 - `nix.yml`: builds the Nix package for x86_64-linux and runs its install
-  check. A pull request, from a fork or not, never gets a secret or the attic
+  check; `build-darwin` does the same for aarch64-darwin on macos-15 (no
+  secret, cache.nixos.org only) and checks the Mach-O linkage. A pull request, from a fork or not, never gets a secret or the attic
   cache. A push to `main` or a `v*` tag builds in a separate job, which also
   pushes the closures to the attic cache, and a following job fetches them from
   attic alone into an empty store. Those two jobs use the GitHub environment

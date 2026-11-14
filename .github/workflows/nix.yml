@@ -1,5 +1,6 @@
-# Builds the Nix package (x86_64-linux), runs its install check, and publishes
-# the result to the attic cache for trusted events only.
+# Builds the Nix package (x86_64-linux and aarch64-darwin), runs its install
+# check, and publishes the result (x86_64-linux) to the attic cache for trusted
+# events only.
 #
 #   pull_request            `build`: build + install check. No secret, no
 #                           Tailscale and no attic cache for any pull request,
@@ -7,6 +8,9 @@
 #                           pull request (ci/*.sh, flake.nix) is not trusted
 #                           with the credentials that write to the cache. It
 #                           uses the public substituters only.
+#                           `build-darwin` builds the same on macos-15 (aarch64-darwin)
+#                           with cache.nixos.org as the only substituter; it uses
+#                           no secret and no environment either.
 #   workflow_dispatch       `build`; never publishes.
 #   push to main, v* tag    `publish`: build + install check, then push the
 #                           closures to attic; `verify-cache` then substitutes
@@ -89,6 +93,111 @@ jobs:
       - name: Build the patched attic client
         timeout-minutes: 90
         run: nix build -L .#attic-client --out-link result-attic
+
+  # aarch64-darwin, pull requests and manual runs: the same builds as `build`
+  # on a macOS runner, in the Nix sandbox, with cache.nixos.org as the only
+  # substituter. No repository secret, no environment, no Tailscale and no
+  # attic cache; the flake's nixConfig (the attic cache) is not accepted. The
+  # token passed to Nix is the automatic read-only one, which only raises the
+  # GitHub API rate limit for fetching the flake inputs.
+  #
+  # Besides building, the job records the runner and timings, the linkage of
+  # the binary, and rehearses `verify-cache`'s signature checks against
+  # cache.nixos.org (nix/darwin-ci-*.sh).
+  build-darwin:
+    if: github.event_name != 'push'
+    runs-on: macos-15
+    timeout-minutes: 240
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24  # v31.11.1
+        with:
+          github_access_token: ${{ github.token }}
+          # The sandbox is asked for explicitly: Nix's default on macOS is off.
+          # Only cache.nixos.org substitutes, and the flake's own nixConfig
+          # is not accepted (accept-flake-config stays off).
+          extra_nix_config: |
+            sandbox = true
+            substituters = https://cache.nixos.org
+            trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+            accept-flake-config = false
+      - name: Record the runner and the Nix configuration
+        timeout-minutes: 10
+        run: nix/darwin-ci-environment.sh
+      - name: The Nix sandbox is on
+        timeout-minutes: 10
+        run: nix/darwin-ci-sandbox-probe.sh
+      # The checks of verify-cache that do not need attic, before the long builds.
+      - name: Rehearse the signature checks of verify-cache with cache.nixos.org
+        timeout-minutes: 15
+        run: nix/darwin-ci-verify.sh
+      - name: Build the dependencies
+        timeout-minutes: 120
+        run: |
+          start=$SECONDS
+          nix build -L --option sandbox true .#cargo-deps --out-link result-deps 2>&1 | tee build-deps.log
+          echo "deps: $((SECONDS - start)) s" | tee -a "$RUNNER_TEMP/times.txt"
+      # The package's install check runs in the Nix sandbox as part of this
+      # build: version, a minimal offline build, the Mach-O check, no
+      # self-update. It prints otool's output before it judges.
+      - name: Build and check the package
+        timeout-minutes: 120
+        run: |
+          start=$SECONDS
+          nix build -L --option sandbox true .#cargo --out-link result-cargo 2>&1 | tee build-cargo.log
+          echo "cargo (with the install check): $((SECONDS - start)) s" | tee -a "$RUNNER_TEMP/times.txt"
+      - name: Record the linkage, references and closure of the package
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        run: nix/darwin-ci-linkage.sh result-cargo result-deps
+      - name: Check the installed copy outside the sandbox
+        timeout-minutes: 10
+        run: |
+          ./result-cargo/bin/cargo -V | tee version.txt
+          grep -F "turtton/cargo $(cat TURTTON_VERSION)," version.txt
+          bash ci/smoke-installed.sh "$PWD/result-cargo/bin/cargo"
+      # Fixtures with paths the check must reject, and the closure of the
+      # package; both depend on the package build only through the closure.
+      - name: Build the Mach-O check fixtures
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        run: |
+          start=$SECONDS
+          nix build -L --option sandbox true .#checks.aarch64-darwin.macho-inspection --no-link 2>&1 | tee build-macho-inspection.log
+          echo "macho-inspection: $((SECONDS - start)) s" | tee -a "$RUNNER_TEMP/times.txt"
+      - name: Build the smoke check and the closure check
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        run: |
+          start=$SECONDS
+          nix build -L --option sandbox true .#checks.aarch64-darwin.smoke .#checks.aarch64-darwin.closure --no-link 2>&1 | tee build-checks.log
+          echo "smoke and closure: $((SECONDS - start)) s" | tee -a "$RUNNER_TEMP/times.txt"
+      - name: HTTPS with the built cargo (outside the Nix sandbox, verification on)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: nix/darwin-ci-https.sh result-cargo/bin/cargo
+      - name: No setting was ignored
+        if: ${{ !cancelled() }}
+        run: |
+          if grep -Ei 'ignoring the (client|user)-specified setting|ignoring untrusted flake configuration' build-*.log; then
+            echo "::error::Nix ignored a setting"
+            exit 1
+          fi
+      - name: Timings
+        if: ${{ !cancelled() }}
+        run: |
+          cat "$RUNNER_TEMP/times.txt"
+          {
+            echo "### build-darwin: build times"
+            echo '```'
+            cat "$RUNNER_TEMP/times.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          df -h / /nix || true
 
   # Main and v* tags only: the code is already merged or tagged. This job
   # builds, checks (inside the Nix sandbox only) and pushes; it never executes
