@@ -1,5 +1,10 @@
 # Website
 
+> **Not published by turtton/cargo.** This is the upstream (huacnlee/cargo) site
+> and its installers. turtton/cargo is distributed through Nix only, so no
+> workflow builds or deploys it and the installers are disabled. See the
+> repository README.
+
 Static Astro site, built with Bun and deployed to GitHub Pages. English lives at
 `/cargo/`, Simplified Chinese at `/cargo/zh-CN/`. All text is in
 `src/lib/copy.ts`.
