@@ -240,11 +240,14 @@
             "/System/Library/Frameworks/Foundation.framework/Versions/"
             "/System/Library/Frameworks/Security.framework/Versions/"
           ];
-          # The store libraries (libcurl's own dependencies) may use any
-          # system framework.
+          # What the store libraries load (libcurl, libkrb5: the same run
+          # shows it): libSystem and four frameworks.
           darwinTransitivePrefixes = [
-            "/usr/lib/"
-            "/System/Library/Frameworks/"
+            "/usr/lib/libSystem.B.dylib"
+            "/System/Library/Frameworks/CoreFoundation.framework/Versions/"
+            "/System/Library/Frameworks/CoreServices.framework/Versions/"
+            "/System/Library/Frameworks/SystemConfiguration.framework/Versions/"
+            "/System/Library/Frameworks/Kerberos.framework/Versions/"
           ];
           machoEnv = ''
             export MACHO_ALLOWED_PREFIXES="${lib.concatStringsSep " " darwinSystemPrefixes}"

@@ -113,6 +113,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+      # The runner image has rustup from Homebrew: its proxies are not in
+      # ~/.cargo/bin, where the `requires_rustup_stable` tests look for them.
+      - name: Link rustup proxies into ~/.cargo/bin
+        run: ci/link-rustup-proxies.sh
+      - run: rustup toolchain install stable --profile minimal --no-self-update
       - name: Library unit tests
         run: cargo test --locked -p cargo --lib
       - name: Fork-specific testsuite modules

@@ -94,22 +94,23 @@ The package targets macOS 14 or later on Apple silicon. It differs from the
 Linux one in two ways that matter at run time:
 
 - It links nixpkgs' libcurl dynamically (`curlMinimal`, a store output that
-  comes with the package's closure) next to the system libraries and
-  frameworks; OpenSSL, libgit2 and SQLite are built in. The upstream
+  comes with the package's closure: 9 store paths, about 90 MiB in all) next to
+  libSystem, libobjc and the CoreFoundation, Foundation and Security
+  frameworks. OpenSSL, libgit2, SQLite and zlib are built in. The upstream
   `all-static` feature does not make curl static on macOS.
-- That libcurl has no CA bundle compiled in, and the system keychain is not
-  used. HTTPS verification stays on, so cargo needs to be told which CA file to
-  trust, as with any Nix-built curl. If `cargo fetch` fails with "SSL
-  certificate problem", set one of
+- TLS verification stays on, and that libcurl does not use the system keychain.
+  It reads a CA file through its OpenSSL, and `cargo fetch` works as is on
+  macOS 15 with no CA setting at all (CI checks it). A CA you added to the
+  keychain only, such as a corporate proxy's, is not in that default bundle.
+  Point cargo at a bundle that has it:
 
   ```sh
-  export SSL_CERT_FILE=/etc/ssl/cert.pem          # the system's bundle, or
-  export SSL_CERT_FILE=$NIX_SSL_CERT_FILE         # the CA file of your Nix setup
-  export CARGO_HTTP_CAINFO=/path/to/ca-bundle.crt # cargo's own setting
+  export CARGO_HTTP_CAINFO=/path/to/ca-bundle.crt
   ```
 
-  or `[http] cainfo = "..."` in `~/.cargo/config.toml`. Verification is never
-  turned off by the package.
+  or `[http] cainfo = "..."` in `~/.cargo/config.toml`. A bundle that does not
+  contain the issuer makes the download fail (CI checks that too); the package
+  never turns verification off.
 
 ## CI and releases
 

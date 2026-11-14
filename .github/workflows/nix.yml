@@ -194,6 +194,9 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           cat "$RUNNER_TEMP/times.txt"
+          echo "== memory and disk after the builds"
+          vm_stat | head -8
+          top -l 1 -n 0 2>/dev/null | grep PhysMem || true
           {
             echo "### build-darwin: build times"
             echo '```'

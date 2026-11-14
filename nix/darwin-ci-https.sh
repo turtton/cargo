@@ -82,6 +82,9 @@ probe nix-ca-file ok SSL_CERT_FILE="$nix_ca"
 probe explicit-ca ok CARGO_HTTP_CAINFO="$cacert"
 probe bogus-ca fail CARGO_HTTP_CAINFO="$work/bogus-ca.pem"
 probe bogus-ca-over-valid-env fail SSL_CERT_FILE="$nix_ca" CARGO_HTTP_CAINFO="$work/bogus-ca.pem"
+# Which variables nixpkgs' OpenSSL honours: recorded, to tell README what to say.
+probe bogus-ssl-cert-file record SSL_CERT_FILE="$work/bogus-ca.pem"
+probe bogus-nix-ssl-cert-file record NIX_SSL_CERT_FILE="$work/bogus-ca.pem"
 
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
   {
