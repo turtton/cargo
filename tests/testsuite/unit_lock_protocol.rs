@@ -1205,13 +1205,30 @@ fn pipelining_notifies_metadata_before_validated_completion() {
             .iter()
             .any(|e| e["phase"] == "WriterAcquired")
     );
-    assert!(
-        exit.stdout
-            .lines()
-            .map(|l| serde_json::from_str::<Value>(l).unwrap())
-            .filter(|m| m["reason"] == "compiler-artifact")
-            .all(|m| m["fresh"] == true)
-    );
+    let artifacts: Vec<Value> = exit
+        .stdout
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .filter(|m| m["reason"] == "compiler-artifact")
+        .collect();
+    let mut targets: Vec<_> = artifacts
+        .iter()
+        .map(|m| m["target"]["name"].as_str().unwrap())
+        .collect();
+    targets.sort_unstable();
+    assert_eq!(targets, ["consumer", "middle", "probe"]);
+    for artifact in &artifacts {
+        let root = match artifact["target"]["name"].as_str().unwrap() {
+            "consumer" => p.root(),
+            package => p.root().join(package),
+        };
+        assert_eq!(
+            artifact["manifest_path"],
+            root.join("Cargo.toml").to_str().unwrap()
+        );
+        assert!(!artifact["filenames"].as_array().unwrap().is_empty());
+    }
+    assert!(artifacts.iter().all(|m| m["fresh"] == true));
     run_binary(&p.root().join("target-one/debug/consumer"), b"A\n");
 }
 
@@ -1317,4 +1334,242 @@ fn baseline_abba_kernel_wait_graph() {
     for path in lock_paths(&home.join("targets")) {
         observer(&path, false);
     }
+}
+
+// Compatibility regressions run the real fork defaults, including content keys,
+// with each test's isolated Cargo home (never the developer's shared pool).
+fn compatibility_cargo(p: &Project, args: &str) -> cargo_test_support::Execs {
+    let mut exec = p.cargo(args);
+    exec.env_remove("__CARGO_FORK_DEFAULTS_OPT_OUT");
+    exec
+}
+
+#[cargo_test]
+fn legacy_probe_preserves_bindeps_configuration() {
+    use cargo_test_support::paths::CargoPathExt as _;
+    let p = project()
+        .file("Cargo.toml", r#"
+            [package]
+            name = "foo"
+            version = "0.1.0"
+            edition = "2021"
+            [build-dependencies]
+            tool = { path = "tool", artifact = "bin" }
+            [workspace]
+        "#)
+        .file("src/lib.rs", "pub fn foo() {}")
+        .file("build.rs", r#"fn main() { assert!(std::path::Path::new(&std::env::var_os("CARGO_BIN_FILE_TOOL").unwrap()).is_file()); }"#)
+        .file("tool/Cargo.toml", r#"[package]
+            name = "tool"
+            version = "0.1.0"
+            edition = "2021"
+        "#)
+        .file("tool/src/main.rs", "fn main() {}")
+        .build();
+    for _ in 0..2 {
+        compatibility_cargo(&p, "build -Zbindeps")
+            .masquerade_as_nightly_cargo(&["bindeps"])
+            .run();
+    }
+    p.root().move_into_the_past();
+    p.change_file("build.rs", r#"fn main() { assert!(std::path::Path::new(&std::env::var_os("CARGO_BIN_FILE_TOOL").unwrap()).is_file()); /* touched */ }"#);
+    compatibility_cargo(&p, "build -Zbindeps")
+        .masquerade_as_nightly_cargo(&["bindeps"])
+        .run();
+}
+
+#[cargo_test]
+fn legacy_probe_preserves_cli_registry_configuration() {
+    use cargo_test_support::registry::{Package, RegistryBuilder};
+    let registry = RegistryBuilder::new()
+        .alternative()
+        .no_configure_registry()
+        .build();
+    Package::new("dep", "1.0.0").alternative(true).publish();
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+            [package]
+            name = "foo"
+            version = "0.1.0"
+            edition = "2021"
+            [dependencies]
+            dep = { version = "1.0.0", registry = "test-registry" }
+        "#,
+        )
+        .file("src/lib.rs", "pub fn foo() {}")
+        .file("build.rs", "fn main() {}")
+        .build();
+    let config = format!(
+        "registries.test-registry.index={:?}",
+        registry.index_url().as_str()
+    );
+    for _ in 0..2 {
+        compatibility_cargo(&p, "build")
+            .arg("--config")
+            .arg(&config)
+            .run();
+    }
+}
+
+#[cargo_test]
+fn fixing_sources_completes_without_publishing_the_old_content_key() {
+    let original = "pub fn foo() -> i32 { let mut x = 1; x }";
+    let p = project().file("src/lib.rs", original).build();
+    compatibility_cargo(&p, "fix --allow-no-vcs --lib").run();
+    assert!(!p.read_file("src/lib.rs").contains("let mut x"));
+    compatibility_cargo(&p, "build --lib").run();
+    let output = compatibility_cargo(&p, "build --lib --message-format=json")
+        .build_command()
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let artifacts: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|m| m["reason"] == "compiler-artifact")
+        .collect();
+    assert_eq!(artifacts.len(), 1);
+    assert_eq!(artifacts[0]["target"]["name"], "foo");
+    assert_eq!(artifacts[0]["fresh"], true);
+    // The original source hashes to the key cargo fix ran under. Its fixed
+    // check output must not be reusable from that pre-edit content key.
+    p.change_file("src/lib.rs", original);
+    compatibility_cargo(&p, "check --lib")
+        .with_stderr_contains("[WARNING] variable does not need to be mutable")
+        .run();
+}
+
+#[cargo_test]
+fn print_cfg_completes_and_is_not_reused_as_a_compilation() {
+    let p = project().file("src/lib.rs", "pub fn foo() {} ").build();
+    for _ in 0..2 {
+        compatibility_cargo(&p, "rustc --lib -- --print=cfg")
+            .with_stdout_contains("target_arch=\"[..]\"")
+            .run();
+    }
+    compatibility_cargo(&p, "build --lib").run();
+    assert!(p.root().join("target/debug/libfoo.rlib").is_file());
+}
+
+#[cargo_test]
+fn unpretty_completes_and_is_not_reused_as_a_compilation() {
+    let p = project().file("src/lib.rs", "pub fn foo() {} ").build();
+    for _ in 0..2 {
+        compatibility_cargo(&p, "rustc --lib -- -Zunpretty=expanded")
+            .env("RUSTC_BOOTSTRAP", "1")
+            .with_stdout_contains("pub fn foo() {}")
+            .run();
+    }
+    compatibility_cargo(&p, "build --lib").run();
+    assert!(p.root().join("target/debug/libfoo.rlib").is_file());
+}
+
+#[cargo_test]
+fn raw_rustdoc_json_completes_and_does_not_reuse_html_fingerprint() {
+    let p = project().file("src/lib.rs", "pub fn foo() {} ").build();
+    for _ in 0..2 {
+        // Prove the invocation ran again, not merely that an old JSON remains.
+        let json = p.root().join("target/doc/foo.json");
+        if json.exists() {
+            fs::remove_file(&json).unwrap();
+        }
+        compatibility_cargo(
+            &p,
+            "rustdoc --lib -- -Zunstable-options --output-format=json",
+        )
+        .env("RUSTC_BOOTSTRAP", "1")
+        .run();
+        let document: Value = serde_json::from_slice(&fs::read(json).unwrap()).unwrap();
+        assert!(document["index"].is_object());
+    }
+    compatibility_cargo(&p, "doc --lib --no-deps").run();
+    assert!(p.root().join("target/doc/foo/index.html").is_file());
+}
+
+#[cargo_test]
+fn fixing_sources_without_content_keys_still_validates_completion() {
+    let p = project()
+        .file("src/lib.rs", "pub fn foo() -> i32 { let mut x = 1; x }")
+        .build();
+    compatibility_cargo(&p, "fix --allow-no-vcs --lib")
+        .env("CARGO_SHARE_WORKSPACE_UNITS", "0")
+        .run();
+    assert!(!p.read_file("src/lib.rs").contains("let mut x"));
+    compatibility_cargo(&p, "build --lib")
+        .env("CARGO_SHARE_WORKSPACE_UNITS", "0")
+        .run();
+}
+
+#[cargo_test]
+fn missing_json_output_is_not_a_successful_completion() {
+    let p = project().file("src/lib.rs", "pub fn foo() {} ").build();
+    let mut controller = Controller::new();
+    let build = controller.spawn(
+        compatibility_cargo(
+            &p,
+            "rustdoc --lib -- -Zunstable-options --output-format=json",
+        )
+        .env("RUSTC_BOOTSTRAP", "1")
+        .build_command(),
+    );
+    let written = controller.until(build.pid, "WorkFinished", "foo", "compile");
+    fs::remove_file(p.root().join("target/doc/foo.json")).unwrap();
+    written.resume(0);
+    let exit = build.wait(&mut controller);
+    assert!(!exit.status.success(), "{exit:?}");
+    assert!(
+        exit.stderr.contains("unit changed while finalizing"),
+        "{exit:?}"
+    );
+    assert!(
+        !controller
+            .history
+            .iter()
+            .any(|e| e["phase"] == "SharedValidated")
+    );
+}
+
+#[cargo_test]
+fn legacy_probe_enumerates_files_added_after_planning() {
+    let p = project()
+        .file("src/lib.rs", "pub fn foo() {}")
+        .file("build.rs", "fn main() {} ")
+        .build();
+    let mut controller = Controller::new();
+    let build = controller.spawn(native_command(&p, "target-one"));
+    let written = controller.until(build.pid, "WorkFinished", "foo", "run-build-script");
+    // Establish a file timestamp relation, not an elapsed-time requirement.
+    // A planning-time file list would miss this new input and falsely validate.
+    let newest = ["Cargo.toml", "Cargo.lock", "src/lib.rs", "build.rs"]
+        .iter()
+        .map(|path| {
+            filetime::FileTime::from_last_modification_time(
+                &fs::metadata(p.root().join(path)).unwrap(),
+            )
+            .unix_seconds()
+        })
+        .max()
+        .unwrap();
+    p.change_file("src/new-input", "added after the probe was prepared");
+    filetime::set_file_mtime(
+        p.root().join("src/new-input"),
+        filetime::FileTime::from_unix_time(newest + 1, 0),
+    )
+    .unwrap();
+    written.resume(0);
+    let exit = build.wait(&mut controller);
+    assert!(!exit.status.success(), "{exit:?}");
+    assert!(
+        exit.stderr.contains("unit changed while finalizing"),
+        "{exit:?}"
+    );
+    assert!(
+        !controller
+            .history
+            .iter()
+            .any(|e| e["phase"] == "SharedValidated" && e["mode"] == "run-build-script")
+    );
 }

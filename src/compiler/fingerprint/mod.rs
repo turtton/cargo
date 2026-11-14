@@ -926,6 +926,69 @@ pub(super) struct PreparedFreshnessProbe {
     custom: Option<super::custom_build::PreparedBuildOutput>,
     legacy: Option<Box<dyn Fn() -> CargoResult<String> + Send>>,
     force: bool,
+    completion: Completion,
+}
+
+/// A successful invocation need not produce a reusable ordinary compilation.
+enum Completion {
+    Reusable,
+    /// The rustfix proxy is permitted to edit inputs; never publish its old key.
+    SourcesModified,
+    /// Print/expansion commands have stdout rather than ordinary artifacts.
+    /// Alternate rustdoc formats have their own expected output files.
+    Command(Vec<PathBuf>),
+}
+
+impl Completion {
+    fn for_unit(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> Self {
+        let bcx = build_runner.bcx;
+        if build_runner.is_primary_package(unit)
+            && bcx
+                .build_config
+                .rustfix_diagnostic_server
+                .borrow()
+                .is_some()
+            && !unit.mode.is_run_custom_build()
+        {
+            return Self::SourcesModified;
+        }
+        let flags = if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
+            &unit.rustdocflags
+        } else {
+            &unit.rustflags
+        };
+        let args: Vec<_> = flags
+            .iter()
+            .chain(bcx.extra_args_for(unit).into_iter().flatten())
+            .map(String::as_str)
+            .collect();
+        let value = |option: &str| {
+            args.iter().enumerate().rev().find_map(|(i, arg)| {
+                if *arg == option {
+                    args.get(i + 1).copied()
+                } else {
+                    arg.strip_prefix(option).and_then(|v| v.strip_prefix('='))
+                }
+            })
+        };
+        if value("--print").is_some()
+            || value("-Zunpretty").is_some()
+            || args
+                .windows(2)
+                .any(|a| a[0] == "-Z" && a[1].starts_with("unpretty="))
+        {
+            return Self::Command(Vec::new());
+        }
+        if unit.mode.is_doc() && value("--output-format") == Some("json") {
+            let dir = if bcx.build_config.intent.wants_doc_json_output() {
+                build_runner.files().out_dir_new_layout(unit)
+            } else {
+                build_runner.files().output_dir(unit)
+            };
+            return Self::Command(vec![dir.join(format!("{}.json", unit.target.crate_name()))]);
+        }
+        Self::Reusable
+    }
 }
 
 impl PreparedFreshnessProbe {
@@ -939,23 +1002,21 @@ impl PreparedFreshnessProbe {
         let legacy: Option<Box<dyn Fn() -> CargoResult<String> + Send>> = if custom {
             let pkg = unit.pkg.clone();
             if pkg.package_id().source_id().is_path() {
-                let cwd = build_runner.bcx.gctx.cwd().to_path_buf();
-                let home = build_runner
-                    .bcx
-                    .gctx
-                    .home()
-                    .as_path_unlocked()
-                    .to_path_buf();
-                let root = pkg.root().to_path_buf();
-                let source_id = pkg.package_id().source_id();
-                let output_roots = legacy_output_roots(build_runner.bcx);
+                let prepared = crate::sources::path::PreparedPathFingerprint::new(
+                    &pkg,
+                    &legacy_output_roots(build_runner.bcx),
+                );
+                let verbosity = build_runner.bcx.gctx.shell().verbosity();
+                let color = match build_runner.bcx.gctx.shell().color_choice() {
+                    cargo_util_terminal::ColorChoice::Always => "always",
+                    cargo_util_terminal::ColorChoice::Never => "never",
+                    cargo_util_terminal::ColorChoice::CargoAuto => "auto",
+                };
                 Some(Box::new(move || {
-                    // Only source enumeration needs a context; construct it on this
-                    // thread, so no non-Send context is captured by the job.
-                    let gctx = GlobalContext::new(crate::Shell::new(), cwd.clone(), home.clone());
-                    let source = crate::sources::path::PathSource::new(&root, source_id, &gctx);
-                    let pkg = source.root_package()?;
-                    crate::sources::path::fingerprint_excluding(&pkg, &gctx, &output_roots)
+                    let mut shell = crate::Shell::new();
+                    shell.set_verbosity(verbosity);
+                    shell.set_color_choice(Some(color))?;
+                    prepared.fingerprint(&mut shell)
                 }))
             } else {
                 let value = pkg_fingerprint(build_runner.bcx, &pkg)?;
@@ -980,6 +1041,7 @@ impl PreparedFreshnessProbe {
                 .then(|| super::custom_build::PreparedBuildOutput::new(build_runner, unit)),
             legacy,
             force,
+            completion: Completion::for_unit(build_runner, unit),
         })
     }
 
@@ -987,10 +1049,40 @@ impl PreparedFreshnessProbe {
     /// made the job runnable. A writer's final verification checks outputs too,
     /// but does not reinterpret a still-running dependency as reusable.
     pub fn is_fresh(&self) -> CargoResult<bool> {
+        if !matches!(self.completion, Completion::Reusable) {
+            return Ok(false);
+        }
         self.check(true)
     }
+
     pub fn verify_written(&self) -> CargoResult<bool> {
-        self.check(false)
+        let outputs = match &self.completion {
+            Completion::Reusable => return self.check(false),
+            Completion::SourcesModified => &self.fingerprint.outputs,
+            Completion::Command(outputs) => outputs,
+        };
+        // dirty.call has already joined a successful compiler/proxy and written
+        // the fingerprint. Verify that completion record and the invocation's
+        // expected outputs under the gate, not whether its inputs are reusable.
+        let on_disk = read_completed_fingerprint(&self.loc)?;
+        // A non-reusable invocation must not leave a completed fingerprint,
+        // including when verification below rejects its completion.
+        self.invalidate()?;
+        let Some(on_disk) = on_disk else {
+            return Ok(false);
+        };
+        let fingerprint = self.fingerprint.execution_snapshot()?;
+        if on_disk != util::to_hex(fingerprint.hash_u64()) {
+            return Ok(false);
+        }
+        for output in outputs {
+            if optional_file(paths::mtime(output), output)?.is_none() {
+                return Ok(false);
+            }
+        }
+        // In particular the old content key of a fix can never be reused,
+        // even though its source-changing invocation completed successfully.
+        Ok(true)
     }
 
     fn check(&self, reuse: bool) -> CargoResult<bool> {
