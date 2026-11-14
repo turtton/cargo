@@ -80,6 +80,12 @@ impl Job {
         &self.fresh
     }
 
+    /// Wraps the complete dirty work, including its fingerprint commit.
+    pub fn wrap(&mut self, wrap: impl FnOnce(Work) -> Work) {
+        let work = mem::replace(&mut self.work, Work::noop());
+        self.work = wrap(work);
+    }
+
     /// Chains the given work by putting it in front of our own unit of work.
     pub fn before(&mut self, next: Work) {
         let prev = mem::replace(&mut self.work, Work::noop());

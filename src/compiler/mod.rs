@@ -101,7 +101,6 @@ use self::trim_paths::trim_paths_args_rustdoc;
 use self::unit_graph::UnitDep;
 
 use crate::compiler::future_incompat::FutureIncompatReport;
-use crate::compiler::locking::LockKey;
 use crate::compiler::timings::SectionTiming;
 pub use crate::compiler::unit::Unit;
 pub use crate::compiler::unit::UnitIndex;
@@ -235,7 +234,7 @@ fn compile<'gctx>(
         fingerprint::prepare_init(build_runner, unit)?;
 
         let job = if unit.mode.is_run_custom_build() {
-            custom_build::prepare(build_runner, unit)?
+            custom_build::prepare(build_runner, unit, lock)?
         } else if unit.mode.is_doc_test() {
             // We run these targets later, so this is just a no-op for now.
             Job::new_fresh()
@@ -255,49 +254,32 @@ fn compile<'gctx>(
                 // Need to link targets on both the dirty and fresh.
                 Ok(work.then(link_targets(build_runner, unit, true)?))
             };
-            job.before(if job.freshness().is_dirty() {
-                let work = if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
+            if job.freshness().is_dirty() {
+                let mut work = if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
                     rustdoc(build_runner, unit)?
                 } else {
                     rustc(build_runner, unit, exec)?
                 };
-                let work = work.then(link_targets(build_runner, unit, false)?);
-                // Another Cargo may build a shared unit while this one waits
-                // for the exclusive lock below; reuse its output then.
-                match fingerprint::built_elsewhere(build_runner, unit) {
-                    Some(built_elsewhere)
-                        if lock.is_some() && build_runner.files().is_shared_unit(unit) =>
-                    {
-                        let fresh = fresh_work(build_runner)?;
-                        Work::new(move |state| {
-                            if built_elsewhere() {
-                                fresh.call(state)
-                            } else {
-                                work.call(state)
-                            }
-                        })
-                    }
-                    _ => work,
+                let done = link_targets(build_runner, unit, false)?;
+                if let Some(lock) = lock {
+                    let probe =
+                        fingerprint::PreparedFreshnessProbe::new(build_runner, unit, force)?;
+                    let fresh = fresh_work(build_runner)?;
+                    build_runner.lock_manager.unlock(&lock)?;
+                    job.before(work);
+                    job.wrap(move |dirty| {
+                        Work::new(move |state| state.run_locked(&lock, probe, dirty, done, fresh))
+                    });
+                } else {
+                    work = fingerprint::invalidate_work(build_runner, unit).then(work);
+                    job.before(work);
+                    job.after(done);
                 }
             } else {
-                fresh_work(build_runner)?
-            });
-
-            // If -Zfine-grain-locking is enabled, we wrap the job with an upgrade to exclusive
-            // lock before starting, then downgrade to a shared lock after the job is finished.
-            if build_runner.bcx.gctx.cli_unstable().fine_grain_locking && job.freshness().is_dirty()
-            {
-                if let Some(lock) = lock {
-                    // Here we unlock the current shared lock to avoid deadlocking with other cargo
-                    // processes. Then we configure our compile job to take an exclusive lock
-                    // before starting. Once we are done compiling (including both rmeta and rlib)
-                    // we downgrade to a shared lock to allow other cargo's to read the build unit.
-                    // We will hold this shared lock for the remainder of compilation to prevent
-                    // other cargo from re-compiling while we are still using the unit.
-                    build_runner.lock_manager.unlock(&lock)?;
-                    job.before(prebuild_lock_exclusive(lock.clone()));
-                    job.after(downgrade_lock_to_shared(lock));
+                if let Some(lock) = &lock {
+                    lock.event("PlanningFresh")?;
                 }
+                job.before(fresh_work(build_runner)?);
             }
 
             job
@@ -457,10 +439,12 @@ fn rustc(
     }
     let env_config = Arc::clone(build_runner.bcx.gctx.env_config()?);
     return Ok(Work::new(move |state| {
-        // Artifacts are in a different location than typical units,
-        // hence we must assure the crate- and target-dependent
-        // directory is present.
-        if artifact.is_true() {
+        // Artifact dependencies and build scripts can compile outside the
+        // pre-created deps directory. In particular, the legacy build-script
+        // directory is needed to compile the script, before its run job can
+        // create OUT_DIR. Prepare it here under the writer/coarse build lock,
+        // not during planning or only when executing the compiled script.
+        if artifact.is_true() || target.is_custom_build() {
             paths::create_dir_all(&root)?;
         }
 
@@ -741,20 +725,6 @@ fn verbose_if_simple_exit_code(err: Error) -> Error {
         Some(n) if cargo_util::is_simple_exit_code(n) => VerboseError::new(err).into(),
         _ => err,
     }
-}
-
-fn prebuild_lock_exclusive(lock: LockKey) -> Work {
-    Work::new(move |state| {
-        state.lock_exclusive(&lock)?;
-        Ok(())
-    })
-}
-
-fn downgrade_lock_to_shared(lock: LockKey) -> Work {
-    Work::new(move |state| {
-        state.downgrade_to_shared(&lock)?;
-        Ok(())
-    })
 }
 
 /// Link the compiled target (often of form `foo-{metadata_hash}`) to the
@@ -2520,7 +2490,7 @@ fn on_stderr_line_inner(
         trace!("found directive from rustc: `{}`", artifact.artifact);
         if artifact.artifact.ends_with(".rmeta") {
             debug!("looks like metadata finished early!");
-            state.rmeta_produced();
+            state.rmeta_produced()?;
         }
         return Ok(false);
     }

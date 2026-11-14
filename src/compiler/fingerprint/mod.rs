@@ -405,6 +405,7 @@ use tracing::{debug, info};
 use crate::compiler::shared_units::Reuse;
 use crate::compiler::unit_graph::UnitDep;
 use crate::context::FingerprintMethod;
+use crate::context::environment::Env;
 use crate::util;
 use crate::util::errors::CargoResult;
 use crate::util::interning::InternedString;
@@ -412,6 +413,7 @@ use crate::util::log_message::LogMessage;
 use crate::util::{StableHasher, internal, path_args};
 use crate::workspace::Package;
 use crate::{CARGO_ENV, GlobalContext};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::BuildContext;
 use super::BuildRunner;
@@ -472,7 +474,10 @@ pub fn prepare_target(
     // compare it to an old version, if any, and attempt to print diagnostic
     // information about failed comparisons to aid in debugging.
     let fingerprint = calculate(build_runner, unit)?;
-    let mtime_on_use = build_runner.bcx.gctx.cli_unstable().mtime_on_use;
+    // This best-effort GC hint must not mutate fingerprints under unit SH.
+    // Fine-grained writers exclusively own every fingerprint modification.
+    let mtime_on_use =
+        bcx.gctx.cli_unstable().mtime_on_use && !bcx.gctx.cli_unstable().fine_grain_locking;
     let dirty_reason = match compare_old_fingerprint(unit, &loc, &*fingerprint, mtime_on_use, force)
     {
         FingerprintComparison::Fresh => None,
@@ -498,6 +503,7 @@ pub fn prepare_target(
     }
 
     let Some(dirty_reason) = dirty_reason else {
+        fingerprint.completed.store(true, Ordering::Release);
         return Ok(Job::new_fresh());
     };
 
@@ -516,40 +522,6 @@ pub fn prepare_target(
         .get(source_id)
         .ok_or_else(|| internal("missing package source"))?;
     source.verify(unit.pkg.package_id())?;
-
-    // Clear out the old fingerprint file if it exists. This protects when
-    // compilation is interrupted leaving a corrupt file. For example, a
-    // project with a lib.rs and integration test (two units):
-    //
-    // 1. Build the library and integration test.
-    // 2. Make a change to lib.rs (NOT the integration test).
-    // 3. Build the integration test, hit Ctrl-C while linking. With gcc, this
-    //    will leave behind an incomplete executable (zero size, or partially
-    //    written). NOTE: The library builds successfully, it is the linking
-    //    of the integration test that we are interrupting.
-    // 4. Build the integration test again.
-    //
-    // Without the following line, then step 3 will leave a valid fingerprint
-    // on the disk. Then step 4 will think the integration test is "fresh"
-    // because:
-    //
-    // - There is a valid fingerprint hash on disk (written in step 1).
-    // - The mtime of the output file (the corrupt integration executable
-    //   written in step 3) is newer than all of its dependencies.
-    // - The mtime of the integration test fingerprint dep-info file (written
-    //   in step 1) is newer than the integration test's source files, because
-    //   we haven't modified any of its source files.
-    //
-    // But the executable is corrupt and needs to be rebuilt. Clearing the
-    // fingerprint at step 3 ensures that Cargo never mistakes a partially
-    // written output as up-to-date.
-    if loc.exists() {
-        // Truncate instead of delete so that compare_old_fingerprint will
-        // still log the reason for the fingerprint failure instead of just
-        // reporting "failed to read fingerprint" during the next build if
-        // this build fails.
-        paths::write(&loc, b"")?;
-    }
 
     let write_fingerprint = if unit.mode.is_run_custom_build() {
         // For build scripts the `local` field of the fingerprint may change
@@ -686,6 +658,9 @@ pub struct Fingerprint {
     /// fingerprints output files are regenerated and look newer than this one.
     #[serde(skip)]
     outputs: Vec<PathBuf>,
+    /// True only after all outputs and the fingerprint have been committed.
+    #[serde(skip)]
+    completed: AtomicBool,
 }
 
 /// Indication of the status on the filesystem for a particular unit.
@@ -813,7 +788,7 @@ impl<'de> Deserialize<'de> for DepFingerprint {
 /// when the filesystem contains stale information (based on mtime currently).
 /// The paths here don't change much between compilations but they're used as
 /// inputs when we probe the filesystem looking at information.
-#[derive(Debug, Serialize, Deserialize, Hash)]
+#[derive(Clone, Debug, Serialize, Deserialize, Hash)]
 enum LocalFingerprint {
     /// This is a precalculated fingerprint which has an opaque string we just
     /// hash as usual. This variant is primarily used for rustdoc where we
@@ -902,6 +877,361 @@ pub enum StaleItem {
     },
 }
 
+/// Only immutable, Send package data needed by filesystem checks.
+struct FreshnessPackage {
+    root: PathBuf,
+    env: HashMap<String, String>,
+}
+
+impl FreshnessPackage {
+    fn new(pkg: &Package) -> Self {
+        Self {
+            root: pkg.root().to_path_buf(),
+            env: pkg
+                .manifest()
+                .metadata()
+                .env_vars()
+                .map(|(k, v)| (k.to_owned(), v.into_owned()))
+                .collect(),
+        }
+    }
+}
+
+/// The same environment rules for planning and execution-time filesystem checks.
+struct FreshnessEnvironment {
+    env: Env,
+    config: Arc<HashMap<String, OsString>>,
+}
+
+impl FreshnessEnvironment {
+    fn new(gctx: &GlobalContext) -> CargoResult<Self> {
+        Ok(Self {
+            env: gctx.env_snapshot(),
+            config: Arc::clone(gctx.env_config()?),
+        })
+    }
+}
+
+/// An owned, repeatable freshness check. Never carries a BuildRunner or a
+/// borrowed GlobalContext to a worker. Every call discards filesystem caches.
+pub(super) struct PreparedFreshnessProbe {
+    fingerprint: Arc<Fingerprint>,
+    pkg: FreshnessPackage,
+    loc: PathBuf,
+    build_root: PathBuf,
+    ws_root: PathBuf,
+    cargo_exe: PathBuf,
+    environment: FreshnessEnvironment,
+    reuse: Option<super::shared_units::PreparedReuse>,
+    custom: Option<super::custom_build::PreparedBuildOutput>,
+    legacy: Option<Box<dyn Fn() -> CargoResult<String> + Send>>,
+    force: bool,
+    completion: Completion,
+}
+
+/// A successful invocation need not produce a reusable ordinary compilation.
+enum Completion {
+    Reusable,
+    /// The rustfix proxy is permitted to edit inputs; never publish its old key.
+    SourcesModified,
+    /// Print/expansion commands have stdout rather than ordinary artifacts.
+    /// Alternate rustdoc formats have their own expected output files.
+    Command(Vec<PathBuf>),
+}
+
+impl Completion {
+    fn for_unit(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> Self {
+        let bcx = build_runner.bcx;
+        if build_runner.is_primary_package(unit)
+            && bcx
+                .build_config
+                .rustfix_diagnostic_server
+                .borrow()
+                .is_some()
+            && !unit.mode.is_run_custom_build()
+        {
+            return Self::SourcesModified;
+        }
+        let flags = if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
+            &unit.rustdocflags
+        } else {
+            &unit.rustflags
+        };
+        let args: Vec<_> = flags
+            .iter()
+            .chain(bcx.extra_args_for(unit).into_iter().flatten())
+            .map(String::as_str)
+            .collect();
+        let value = |option: &str| {
+            args.iter().enumerate().rev().find_map(|(i, arg)| {
+                if *arg == option {
+                    args.get(i + 1).copied()
+                } else {
+                    arg.strip_prefix(option).and_then(|v| v.strip_prefix('='))
+                }
+            })
+        };
+        if value("--print").is_some()
+            || value("-Zunpretty").is_some()
+            || args
+                .windows(2)
+                .any(|a| a[0] == "-Z" && a[1].starts_with("unpretty="))
+        {
+            return Self::Command(Vec::new());
+        }
+        if unit.mode.is_doc() && value("--output-format") == Some("json") {
+            let dir = if bcx.build_config.intent.wants_doc_json_output() {
+                build_runner.files().out_dir_new_layout(unit)
+            } else {
+                build_runner.files().output_dir(unit)
+            };
+            return Self::Command(vec![dir.join(format!("{}.json", unit.target.crate_name()))]);
+        }
+        Self::Reusable
+    }
+}
+
+impl PreparedFreshnessProbe {
+    pub fn new(
+        build_runner: &mut BuildRunner<'_, '_>,
+        unit: &Unit,
+        force: bool,
+    ) -> CargoResult<Self> {
+        let custom = unit.mode.is_run_custom_build()
+            && build_script_override_fingerprint(build_runner, unit).is_none();
+        let legacy: Option<Box<dyn Fn() -> CargoResult<String> + Send>> = if custom {
+            let pkg = unit.pkg.clone();
+            if pkg.package_id().source_id().is_path() {
+                let prepared = crate::sources::path::PreparedPathFingerprint::new(
+                    &pkg,
+                    &legacy_output_roots(build_runner.bcx),
+                );
+                let verbosity = build_runner.bcx.gctx.shell().verbosity();
+                let color = match build_runner.bcx.gctx.shell().color_choice() {
+                    cargo_util_terminal::ColorChoice::Always => "always",
+                    cargo_util_terminal::ColorChoice::Never => "never",
+                    cargo_util_terminal::ColorChoice::CargoAuto => "auto",
+                };
+                Some(Box::new(move || {
+                    let mut shell = crate::Shell::new();
+                    shell.set_verbosity(verbosity);
+                    shell.set_color_choice(Some(color))?;
+                    prepared.fingerprint(&mut shell)
+                }))
+            } else {
+                let value = pkg_fingerprint(build_runner.bcx, &pkg)?;
+                Some(Box::new(move || Ok(value.clone())))
+            }
+        } else {
+            None
+        };
+        Ok(Self {
+            fingerprint: calculate(build_runner, unit)?,
+            pkg: FreshnessPackage::new(&unit.pkg),
+            loc: build_runner.files().fingerprint_file_path(unit, ""),
+            build_root: build_root(build_runner, unit),
+            ws_root: build_runner.bcx.ws.root().to_path_buf(),
+            cargo_exe: build_runner.bcx.gctx.cargo_exe()?.to_path_buf(),
+            environment: FreshnessEnvironment::new(build_runner.bcx.gctx)?,
+            reuse: build_runner
+                .shared_units
+                .as_ref()
+                .and_then(|s| s.prepare_reuse(unit, &build_runner.files().build_unit_dir(unit))),
+            custom: custom
+                .then(|| super::custom_build::PreparedBuildOutput::new(build_runner, unit)),
+            legacy,
+            force,
+            completion: Completion::for_unit(build_runner, unit),
+        })
+    }
+
+    /// Reuse requires finalized dependencies, even when rmeta pipelining has
+    /// made the job runnable. A writer's final verification checks outputs too,
+    /// but does not reinterpret a still-running dependency as reusable.
+    pub fn is_fresh(&self) -> CargoResult<bool> {
+        if !matches!(self.completion, Completion::Reusable) {
+            return Ok(false);
+        }
+        self.check(true)
+    }
+
+    pub fn verify_written(&self) -> CargoResult<bool> {
+        let outputs = match &self.completion {
+            Completion::Reusable => return self.check(false),
+            Completion::SourcesModified => &self.fingerprint.outputs,
+            Completion::Command(outputs) => outputs,
+        };
+        // dirty.call has already joined a successful compiler/proxy and written
+        // the fingerprint. Verify that completion record and the invocation's
+        // expected outputs under the gate, not whether its inputs are reusable.
+        let on_disk = read_completed_fingerprint(&self.loc)?;
+        // A non-reusable invocation must not leave a completed fingerprint,
+        // including when verification below rejects its completion.
+        self.invalidate()?;
+        let Some(on_disk) = on_disk else {
+            return Ok(false);
+        };
+        let fingerprint = self.fingerprint.execution_snapshot()?;
+        if on_disk != util::to_hex(fingerprint.hash_u64()) {
+            return Ok(false);
+        }
+        for output in outputs {
+            if optional_file(paths::mtime(output), output)?.is_none() {
+                return Ok(false);
+            }
+        }
+        // In particular the old content key of a fix can never be reused,
+        // even though its source-changing invocation completed successfully.
+        Ok(true)
+    }
+
+    fn check(&self, reuse: bool) -> CargoResult<bool> {
+        if reuse && self.force {
+            return Ok(false);
+        }
+        if reuse && !self.fingerprint.dependencies_completed() {
+            return Ok(false);
+        }
+        let Some(on_disk) = read_completed_fingerprint(&self.loc)? else {
+            return Ok(false);
+        };
+        let mut fingerprint = self.fingerprint.execution_snapshot()?;
+        if let Some(custom) = &self.custom {
+            let deps = match custom.deps() {
+                Ok(deps) => deps,
+                Err(e)
+                    if e.chain().any(|e| {
+                        e.downcast_ref::<io::Error>()
+                            .is_some_and(|e| e.kind() == io::ErrorKind::NotFound)
+                    }) =>
+                {
+                    return Ok(false);
+                }
+                Err(e) => {
+                    if e.chain().any(|e| e.downcast_ref::<io::Error>().is_some()) {
+                        return Err(e)
+                            .context("failed to reload build script output for freshness");
+                    }
+                    // A completed fingerprint accompanied by incomplete or
+                    // malformed script output is not a reusable result.
+                    return Ok(false);
+                }
+            };
+            let local = if deps.rerun_if_changed.is_empty() && deps.rerun_if_env_changed.is_empty()
+            {
+                vec![LocalFingerprint::Precalculated((self
+                    .legacy
+                    .as_ref()
+                    .unwrap())(
+                )?)]
+            } else {
+                local_fingerprints_deps(
+                    &deps,
+                    &self.build_root,
+                    &self.pkg.root,
+                    &self.environment.config,
+                )
+            };
+            *fingerprint.local.get_mut().unwrap() = local;
+        }
+        let policy = self.reuse.as_ref().map(|p| p.check()).transpose()?;
+        let shared_files = match &policy {
+            Some(Reuse::Rebuild(_)) => return Ok(false),
+            Some(Reuse::Content(files)) => Some(&**files),
+            _ => None,
+        };
+        fingerprint.check_filesystem(
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &self.pkg,
+            &self.build_root,
+            &self.ws_root,
+            &self.cargo_exe,
+            &self.environment,
+            shared_files,
+        )?;
+        let fresh =
+            fingerprint.fs_status.up_to_date() && on_disk == util::to_hex(fingerprint.hash_u64());
+        if fresh {
+            *self.fingerprint.local.lock().unwrap() = fingerprint.local.into_inner().unwrap();
+            self.fingerprint.clear_memoized();
+        }
+        Ok(fresh)
+    }
+
+    pub fn invalidate(&self) -> CargoResult<()> {
+        paths::write(&self.loc, b"")
+    }
+}
+
+impl Fingerprint {
+    fn dependencies_completed(&self) -> bool {
+        fn visit(fingerprint: &Fingerprint, seen: &mut HashSet<usize>) -> bool {
+            fingerprint.deps.iter().all(|d| {
+                let identity = Arc::as_ptr(&d.fingerprint) as usize;
+                !seen.insert(identity)
+                    || (d.fingerprint.completed.load(Ordering::Acquire)
+                        && visit(&d.fingerprint, seen))
+            })
+        }
+        visit(self, &mut HashSet::default())
+    }
+
+    /// Refresh dependency output mtimes, never their planning-time fs_status.
+    /// Memoize this invocation's snapshots, not filesystem results across probes:
+    /// diamond-shaped dependency graphs must not expand exponentially.
+    fn execution_snapshot(&self) -> CargoResult<Self> {
+        self.execution_snapshot_inner(&mut HashMap::default())
+    }
+
+    fn execution_snapshot_inner(
+        &self,
+        cache: &mut HashMap<(usize, bool), Arc<Self>>,
+    ) -> CargoResult<Self> {
+        let mut deps = self.deps.clone();
+        for dep in &mut deps {
+            let key = (
+                Arc::as_ptr(&dep.fingerprint) as usize,
+                dep.only_requires_rmeta,
+            );
+            if let Some(snapshot) = cache.get(&key) {
+                dep.fingerprint = Arc::clone(snapshot);
+                continue;
+            }
+            let mut snapshot = dep.fingerprint.execution_snapshot_inner(cache)?;
+            let mtimes: Option<HashMap<_, _>> = snapshot
+                .outputs
+                .iter()
+                .filter(|p| !dep.only_requires_rmeta || p.extension().is_some_and(|e| e == "rmeta"))
+                .map(|p| Ok(optional_file(paths::mtime(p), p)?.map(|mtime| (p.clone(), mtime))))
+                .collect::<CargoResult<Option<_>>>()?;
+            snapshot.fs_status = mtimes
+                .map(|mtimes| FsStatus::UpToDate { mtimes })
+                .unwrap_or(FsStatus::Stale);
+            dep.fingerprint = Arc::new(snapshot);
+            cache.insert(key, Arc::clone(&dep.fingerprint));
+        }
+        Ok(Self {
+            rustc: self.rustc,
+            features: self.features.clone(),
+            declared_features: self.declared_features.clone(),
+            target: self.target,
+            path: self.path,
+            profile: self.profile,
+            deps,
+            local: Mutex::new(self.local.lock().unwrap().clone()),
+            memoized_hash: Mutex::new(None),
+            rustflags: self.rustflags.clone(),
+            config: self.config,
+            compile_kind: self.compile_kind,
+            index: self.index,
+            fs_status: FsStatus::Stale,
+            outputs: self.outputs.clone(),
+            completed: AtomicBool::new(self.completed.load(Ordering::Acquire)),
+        })
+    }
+}
+
 impl LocalFingerprint {
     /// Read the environment variable of the given env `key`, and creates a new
     /// [`LocalFingerprint::RerunIfEnvChanged`] for it. The `env_config` is used firstly
@@ -940,14 +1270,14 @@ impl LocalFingerprint {
         &self,
         mtime_cache: &mut HashMap<PathBuf, FileTime>,
         checksum_cache: &mut HashMap<PathBuf, Checksum>,
-        pkg: &Package,
+        pkg: &FreshnessPackage,
         build_root: &Path,
         ws_root: &Path,
         cargo_exe: &Path,
-        gctx: &GlobalContext,
+        environment: &FreshnessEnvironment,
         shared_files: Option<&HashSet<PathBuf>>,
     ) -> CargoResult<Option<StaleItem>> {
-        let pkg_root = pkg.root();
+        let pkg_root = &pkg.root;
         match self {
             // We need to parse `dep_info`, learn about the crate's dependencies.
             //
@@ -970,8 +1300,8 @@ impl LocalFingerprint {
                     info.files.retain(|file, _| !shared_files.contains(file));
                 }
                 for (key, previous) in info.env.iter() {
-                    if let Some(value) = pkg.manifest().metadata().env_var(key.as_str()) {
-                        if Some(value.as_ref()) == previous.as_deref() {
+                    if let Some(value) = pkg.env.get(key.as_str()) {
+                        if Some(value.as_str()) == previous.as_deref() {
                             continue;
                         }
                     }
@@ -984,10 +1314,10 @@ impl LocalFingerprint {
                             )
                         })?)
                     } else {
-                        if let Some(value) = gctx.env_config()?.get(key) {
+                        if let Some(value) = environment.config.get(key) {
                             value.to_str()
                         } else {
-                            gctx.get_env(key).ok()
+                            environment.env.get_env(key).ok()
                         }
                     };
                     if current == previous.as_deref() {
@@ -1000,32 +1330,32 @@ impl LocalFingerprint {
                     }));
                 }
                 match fingerprint {
-                    FingerprintMethod::Content => Ok(find_stale_file(
+                    FingerprintMethod::Content => find_stale_file(
                         mtime_cache,
                         checksum_cache,
                         &dep_info,
                         info.files.iter().map(|(file, checksum)| (file, *checksum)),
                         *fingerprint,
-                    )),
-                    FingerprintMethod::Mtime => Ok(find_stale_file(
+                    ),
+                    FingerprintMethod::Mtime => find_stale_file(
                         mtime_cache,
                         checksum_cache,
                         &dep_info,
                         info.files.into_keys().map(|p| (p, None)),
                         *fingerprint,
-                    )),
+                    ),
                 }
             }
 
             // We need to verify that no paths listed in `paths` are newer than
             // the `output` path itself, or the last time the build script ran.
-            LocalFingerprint::RerunIfChanged { output, paths } => Ok(find_stale_file(
+            LocalFingerprint::RerunIfChanged { output, paths } => find_stale_file(
                 mtime_cache,
                 checksum_cache,
                 &build_root.join(output),
                 paths.iter().map(|p| (pkg_root.join(p), None)),
                 FingerprintMethod::Mtime,
-            )),
+            ),
 
             // These have no dependencies on the filesystem, and their values
             // are included natively in the `Fingerprint` hash so nothing
@@ -1063,7 +1393,12 @@ impl Fingerprint {
             index: UnitIndex::default(),
             fs_status: FsStatus::Stale,
             outputs: Vec::new(),
+            completed: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn mark_completed(&self) {
+        self.completed.store(true, Ordering::Release);
     }
 
     /// For performance reasons fingerprints will memoize their own hash, but
@@ -1265,16 +1600,16 @@ impl Fingerprint {
         &mut self,
         mtime_cache: &mut HashMap<PathBuf, FileTime>,
         checksum_cache: &mut HashMap<PathBuf, Checksum>,
-        pkg: &Package,
+        pkg: &FreshnessPackage,
         build_root: &Path,
         ws_root: &Path,
         cargo_exe: &Path,
-        gctx: &GlobalContext,
+        environment: &FreshnessEnvironment,
         shared_files: Option<&HashSet<PathBuf>>,
     ) -> CargoResult<()> {
         assert!(!self.fs_status.up_to_date());
 
-        let pkg_root = pkg.root();
+        let pkg_root = &pkg.root;
         let mut mtimes = HashMap::default();
 
         // Get the `mtime` of all outputs. Optionally update their mtime
@@ -1282,7 +1617,7 @@ impl Fingerprint {
         // minimum mtime as it's the one we'll be comparing to inputs and
         // dependencies.
         for output in self.outputs.iter() {
-            let Ok(mtime) = paths::mtime(output) else {
+            let Some(mtime) = optional_file(paths::mtime(output), output)? else {
                 // This path failed to report its `mtime`. It probably doesn't
                 // exists, so leave ourselves as stale and bail out.
                 let item = StaleItem::FailedToReadMetadata {
@@ -1380,7 +1715,7 @@ impl Fingerprint {
                 build_root,
                 ws_root,
                 cargo_exe,
-                gctx,
+                environment,
                 shared_files,
             )? {
                 item.log();
@@ -1574,7 +1909,9 @@ fn calculate(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult
     let reuse = build_runner
         .shared_units
         .as_ref()
-        .and_then(|s| s.reuse(unit, &build_runner.files().build_unit_dir(unit)));
+        .map(|s| s.reuse(unit, &build_runner.files().build_unit_dir(unit)))
+        .transpose()?
+        .flatten();
     match reuse {
         Some(Reuse::Rebuild(marker)) => {
             fingerprint.fs_status = FsStatus::StaleItem(StaleItem::MissingFile { path: marker });
@@ -1587,11 +1924,11 @@ fn calculate(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult
             fingerprint.check_filesystem(
                 &mut build_runner.mtime_cache,
                 &mut build_runner.checksum_cache,
-                &unit.pkg,
+                &FreshnessPackage::new(&unit.pkg),
                 &build_root,
                 ws_root,
                 cargo_exe,
-                build_runner.bcx.gctx,
+                &FreshnessEnvironment::new(build_runner.bcx.gctx)?,
                 shared_files,
             )?;
         }
@@ -1754,6 +2091,7 @@ fn calculate_normal(
         rustflags: extra_flags,
         fs_status: FsStatus::Stale,
         outputs,
+        completed: AtomicBool::new(false),
     })
 }
 
@@ -2000,25 +2338,11 @@ fn local_fingerprints_deps(
     local
 }
 
-/// Returns a check, to run once the dependencies of `unit` are built, of
-/// whether another Cargo has built it into a shared build-dir with the same
-/// inputs since this one found it dirty: the fingerprint on disk is then the
-/// one this build would write.
-///
-/// Only meaningful for units whose fingerprint does not depend on mtimes, as
-/// is the case for registry and git packages.
-pub fn built_elsewhere(
-    build_runner: &BuildRunner<'_, '_>,
-    unit: &Unit,
-) -> Option<impl Fn() -> bool + Send + 'static> {
+/// Invalidate only after the executing job owns its write protection. A fresh
+/// replay must not invalidate or later write a dirty job's fingerprint.
+pub(super) fn invalidate_work(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> Work {
     let loc = build_runner.files().fingerprint_file_path(unit, "");
-    let fingerprint = Arc::clone(build_runner.fingerprints.get(unit)?);
-    Some(move || {
-        // Dependencies feed this fingerprint, so it is only final now.
-        fs::read_to_string(&loc).is_ok_and(|on_disk| {
-            !on_disk.is_empty() && on_disk == util::to_hex(fingerprint.hash_u64())
-        })
-    })
+    Work::new(move |_| paths::write(&loc, b""))
 }
 
 /// Writes the short fingerprint hash value to `<loc>`
@@ -2141,9 +2465,28 @@ fn _compare_old_fingerprint(
     Ok(FingerprintComparison::Dirty { reason })
 }
 
+/// Actual roots only, shared by planning and execution-time legacy checks.
+fn legacy_output_roots(bcx: &BuildContext<'_, '_>) -> Vec<PathBuf> {
+    let mut roots = vec![
+        bcx.ws.build_dir().into_path_unlocked(),
+        bcx.ws.target_dir().into_path_unlocked(),
+    ];
+    if let Some(shared) = bcx.ws.shared_deps_dir() {
+        roots.push(shared);
+    }
+    roots
+}
+
 /// Calculates the fingerprint of a unit thats contains no dep-info files.
 fn pkg_fingerprint(bcx: &BuildContext<'_, '_>, pkg: &Package) -> CargoResult<String> {
     let source_id = pkg.package_id().source_id();
+    if source_id.is_path() && bcx.gctx.cli_unstable().fine_grain_locking {
+        return crate::sources::path::fingerprint_excluding(
+            pkg,
+            bcx.gctx,
+            &legacy_output_roots(bcx),
+        );
+    }
     let sources = bcx.packages.sources();
 
     let source = sources
@@ -2152,24 +2495,57 @@ fn pkg_fingerprint(bcx: &BuildContext<'_, '_>, pkg: &Package) -> CargoResult<Str
     source.fingerprint(pkg)
 }
 
-/// The `reference` file is considered as "stale" if any file from `paths` has a newer mtime.
+/// Invalidation and interrupted writes must not authorize reuse, including
+/// malformed bytes that are not UTF-8. Only a complete hex hash can be fresh.
+fn read_completed_fingerprint(path: &Path) -> CargoResult<Option<String>> {
+    let Some(value) = optional_file(fs::read(path), path)? else {
+        return Ok(None);
+    };
+    if value.len() != std::mem::size_of::<u64>() * 2 || !value.iter().all(u8::is_ascii_hexdigit) {
+        return Ok(None);
+    }
+    Ok(Some(String::from_utf8(value).unwrap()))
+}
+
+/// Missing files are freshness misses; other IO failures must retain context.
+fn optional_file<T, E: Into<anyhow::Error>>(
+    result: Result<T, E>,
+    path: &Path,
+) -> CargoResult<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(e) => {
+            let e = e.into();
+            if e.chain().any(|e| {
+                e.downcast_ref::<io::Error>()
+                    .is_some_and(|e| e.kind() == io::ErrorKind::NotFound)
+            }) {
+                Ok(None)
+            } else {
+                Err(e).with_context(|| format!("failed to check freshness of {}", path.display()))
+            }
+        }
+    }
+}
+
+/// The `reference` file is stale if an input is newer (or has a changed checksum).
 fn find_stale_file<I, P>(
     mtime_cache: &mut HashMap<PathBuf, FileTime>,
     checksum_cache: &mut HashMap<PathBuf, Checksum>,
     reference: &Path,
     paths: I,
     fingerprint: FingerprintMethod,
-) -> Option<StaleItem>
+) -> CargoResult<Option<StaleItem>>
 where
     I: IntoIterator<Item = (P, Option<(u64, Checksum)>)>,
     P: AsRef<Path>,
 {
-    let reference_mtime = match paths::mtime(reference) {
-        Ok(mtime) => mtime,
-        Err(..) => {
-            return Some(StaleItem::MissingFile {
+    let reference_mtime = match optional_file(paths::mtime(reference), reference)? {
+        Some(mtime) => mtime,
+        None => {
+            return Ok(Some(StaleItem::MissingFile {
                 path: reference.to_path_buf(),
-            });
+            }));
         }
     };
 
@@ -2197,36 +2573,40 @@ where
         match fingerprint {
             FingerprintMethod::Content => {
                 let Some((file_len, prior_checksum)) = prior_checksum else {
-                    return Some(StaleItem::MissingChecksum {
+                    return Ok(Some(StaleItem::MissingChecksum {
                         path: path.to_path_buf(),
-                    });
+                    }));
                 };
                 let path_buf = path.to_path_buf();
 
                 let path_checksum = match checksum_cache.entry(path_buf) {
                     Entry::Occupied(o) => *o.get(),
                     Entry::Vacant(v) => {
-                        let Ok(current_file_len) = fs::metadata(&path).map(|m| m.len()) else {
-                            return Some(StaleItem::FailedToReadMetadata {
+                        let Some(current_file_len) =
+                            optional_file(fs::metadata(&path).map(|m| m.len()), path)?
+                        else {
+                            return Ok(Some(StaleItem::FailedToReadMetadata {
                                 path: path.to_path_buf(),
-                            });
+                            }));
                         };
                         if current_file_len != file_len {
-                            return Some(StaleItem::FileSizeChanged {
+                            return Ok(Some(StaleItem::FileSizeChanged {
                                 path: path.to_path_buf(),
                                 new_size: current_file_len,
                                 old_size: file_len,
-                            });
+                            }));
                         }
-                        let Ok(file) = File::open(path) else {
-                            return Some(StaleItem::MissingFile {
+                        let Some(file) = optional_file(File::open(path), path)? else {
+                            return Ok(Some(StaleItem::MissingFile {
                                 path: path.to_path_buf(),
-                            });
+                            }));
                         };
-                        let Ok(checksum) = Checksum::compute(prior_checksum.algo(), file) else {
-                            return Some(StaleItem::UnableToReadFile {
+                        let Some(checksum) =
+                            optional_file(Checksum::compute(prior_checksum.algo(), file), path)?
+                        else {
+                            return Ok(Some(StaleItem::UnableToReadFile {
                                 path: path.to_path_buf(),
-                            });
+                            }));
                         };
                         *v.insert(checksum)
                     }
@@ -2234,20 +2614,20 @@ where
                 if path_checksum == prior_checksum {
                     continue;
                 }
-                return Some(StaleItem::ChangedChecksum {
+                return Ok(Some(StaleItem::ChangedChecksum {
                     source: path.to_path_buf(),
                     stored_checksum: prior_checksum,
                     new_checksum: path_checksum,
-                });
+                }));
             }
             FingerprintMethod::Mtime => {
                 let path_mtime = match mtime_cache.entry(path.to_path_buf()) {
                     Entry::Occupied(o) => *o.get(),
                     Entry::Vacant(v) => {
-                        let Ok(mtime) = paths::mtime_recursive(path) else {
-                            return Some(StaleItem::MissingFile {
+                        let Some(mtime) = optional_file(paths::mtime_recursive(path), path)? else {
+                            return Ok(Some(StaleItem::MissingFile {
                                 path: path.to_path_buf(),
-                            });
+                            }));
                         };
                         *v.insert(mtime)
                     }
@@ -2275,12 +2655,12 @@ where
                     continue;
                 }
 
-                return Some(StaleItem::ChangedFile {
+                return Ok(Some(StaleItem::ChangedFile {
                     reference: reference.to_path_buf(),
                     reference_mtime,
                     stale: path.to_path_buf(),
                     stale_mtime: path_mtime,
-                });
+                }));
             }
         }
     }
@@ -2289,5 +2669,107 @@ where
         "all paths up-to-date relative to {:?} mtime={}",
         reference, reference_mtime
     );
-    None
+    Ok(None)
+}
+
+#[cfg(test)]
+mod execution_tests {
+    use super::*;
+
+    #[test]
+    fn prepared_probe_is_send_and_static() {
+        fn require_send_static<T: Send + 'static>() {}
+        require_send_static::<PreparedFreshnessProbe>();
+    }
+
+    #[test]
+    fn execution_snapshot_ignores_planning_output_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("lib.rlib");
+        fs::write(&output, "complete").unwrap();
+        let mut dependency = Fingerprint::new();
+        dependency.outputs.push(output.clone());
+        dependency.fs_status = FsStatus::Stale;
+        dependency.mark_completed();
+        let mut parent = Fingerprint::new();
+        parent.deps.push(DepFingerprint {
+            pkg_id: 0,
+            name: "dep".into(),
+            public: false,
+            only_requires_rmeta: false,
+            fingerprint: Arc::new(dependency),
+        });
+        let snapshot = parent.execution_snapshot().unwrap();
+        assert!(snapshot.deps[0].fingerprint.fs_status.up_to_date());
+        assert!(
+            snapshot.deps[0]
+                .fingerprint
+                .completed
+                .load(Ordering::Acquire)
+        );
+        fs::remove_file(&output).unwrap();
+        assert!(
+            !parent.execution_snapshot().unwrap().deps[0]
+                .fingerprint
+                .fs_status
+                .up_to_date()
+        );
+    }
+
+    #[test]
+    fn completed_pipelined_parent_does_not_hide_an_unfinished_dependency() {
+        let dependency = Arc::new(Fingerprint::new());
+        let mut middle = Fingerprint::new();
+        middle.deps.push(DepFingerprint {
+            pkg_id: 0,
+            name: "dependency".into(),
+            public: false,
+            only_requires_rmeta: true,
+            fingerprint: dependency.clone(),
+        });
+        middle.mark_completed();
+        let mut root = Fingerprint::new();
+        root.deps.push(DepFingerprint {
+            pkg_id: 1,
+            name: "middle".into(),
+            public: false,
+            only_requires_rmeta: true,
+            fingerprint: Arc::new(middle),
+        });
+        assert!(!root.dependencies_completed());
+        dependency.mark_completed();
+        assert!(root.dependencies_completed());
+    }
+
+    #[test]
+    fn unfinished_fingerprints_are_dirty_including_non_utf8_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fingerprint");
+        assert!(read_completed_fingerprint(&path).unwrap().is_none());
+        for unfinished in [&b""[..], &b"1234"[..], &[0xff; 16][..]] {
+            fs::write(&path, unfinished).unwrap();
+            assert!(read_completed_fingerprint(&path).unwrap().is_none());
+        }
+        let complete = util::to_hex(1);
+        fs::write(&path, &complete).unwrap();
+        assert_eq!(read_completed_fingerprint(&path).unwrap(), Some(complete));
+    }
+
+    #[test]
+    fn io_errors_are_not_missing_fingerprints() {
+        let path = Path::new("unit/dep-info");
+        assert!(
+            optional_file::<(), _>(Err(io::Error::from(io::ErrorKind::NotFound)), path)
+                .unwrap()
+                .is_none()
+        );
+        let error =
+            optional_file::<(), _>(Err(io::Error::from(io::ErrorKind::PermissionDenied)), path)
+                .unwrap_err();
+        assert!(error.to_string().contains("unit/dep-info"));
+        assert!(error.chain().any(|e| {
+            e.downcast_ref::<io::Error>()
+                .is_some_and(|e| e.kind() == io::ErrorKind::PermissionDenied)
+        }));
+    }
 }

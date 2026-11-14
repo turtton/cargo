@@ -571,18 +571,46 @@ fn first_package<'p>(
 /// use other methods like `.gitignore`, `package.include`, or
 /// `package.exclude` to filter the list of files.
 pub fn list_files(pkg: &Package, gctx: &GlobalContext) -> CargoResult<Vec<PathEntry>> {
-    _list_files(pkg, gctx).with_context(|| {
-        format!(
-            "failed to determine list of files in {}",
-            pkg.root().display()
-        )
-    })
+    FileListPackage::new(pkg)
+        .list_files(&mut gctx.shell())
+        .with_context(|| {
+            format!(
+                "failed to determine list of files in {}",
+                pkg.root().display()
+            )
+        })
+}
+
+/// Owned manifest inputs for enumeration, not a snapshot of the file list.
+/// Workers rediscover Git state and walk the current filesystem on every call.
+struct FileListPackage {
+    root: PathBuf,
+    include: Vec<String>,
+    exclude: Vec<String>,
+}
+
+impl FileListPackage {
+    fn new(pkg: &Package) -> Self {
+        Self {
+            root: pkg.root().to_path_buf(),
+            include: pkg.manifest().include().to_vec(),
+            exclude: pkg.manifest().exclude().to_vec(),
+        }
+    }
+
+    fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn list_files(&self, shell: &mut crate::Shell) -> CargoResult<Vec<PathEntry>> {
+        _list_files(self, shell)
+    }
 }
 
 /// See [`PathSource::list_files`].
-fn _list_files(pkg: &Package, gctx: &GlobalContext) -> CargoResult<Vec<PathEntry>> {
+fn _list_files(pkg: &FileListPackage, shell: &mut crate::Shell) -> CargoResult<Vec<PathEntry>> {
     let root = pkg.root();
-    let no_include_option = pkg.manifest().include().is_empty();
+    let no_include_option = pkg.include.is_empty();
     let git_repo = if no_include_option {
         discover_gix_repo(root)?
     } else {
@@ -594,13 +622,13 @@ fn _list_files(pkg: &Package, gctx: &GlobalContext) -> CargoResult<Vec<PathEntry
         // no include option and not git repo discovered (see rust-lang/cargo#7183).
         exclude_builder.add_line(None, ".*")?;
     }
-    for rule in pkg.manifest().exclude() {
+    for rule in &pkg.exclude {
         exclude_builder.add_line(None, rule)?;
     }
     let ignore_exclude = exclude_builder.build()?;
 
     let mut include_builder = GitignoreBuilder::new(root);
-    for rule in pkg.manifest().include() {
+    for rule in &pkg.include {
         include_builder.add_line(None, rule)?;
     }
     let ignore_include = include_builder.build()?;
@@ -640,11 +668,11 @@ fn _list_files(pkg: &Package, gctx: &GlobalContext) -> CargoResult<Vec<PathEntry
     // Attempt Git-prepopulate only if no `include` (see rust-lang/cargo#4135).
     if no_include_option {
         if let Some(repo) = git_repo {
-            return list_files_gix(pkg, &repo, &filter, gctx);
+            return list_files_gix(pkg, &repo, &filter, shell);
         }
     }
     let mut ret = Vec::new();
-    list_files_walk(pkg.root(), &mut ret, true, &filter, gctx)?;
+    list_files_walk(pkg.root(), &mut ret, true, &filter, shell)?;
     Ok(ret)
 }
 
@@ -700,12 +728,12 @@ fn discover_gix_repo(root: &Path) -> CargoResult<Option<gix::Repository>> {
 /// Symlinks to directories will also be resolved, but walked as repositories if they
 /// point to one to avoid picking up `.git` directories.
 fn list_files_gix(
-    pkg: &Package,
+    pkg: &FileListPackage,
     repo: &gix::Repository,
     filter: &dyn Fn(&Path, bool) -> bool,
-    gctx: &GlobalContext,
+    shell: &mut crate::Shell,
 ) -> CargoResult<Vec<PathEntry>> {
-    debug!("list_files_gix {}", pkg.package_id());
+    debug!("list_files_gix {}", pkg.root().display());
     let options = repo
         .dirwalk_options()?
         .emit_untracked(gix::dir::walk::EmissionMode::Matching)
@@ -834,10 +862,10 @@ fn list_files_gix(
             // .git repositories.
             match gix::open(&file_path) {
                 Ok(sub_repo) => {
-                    files.extend(list_files_gix(pkg, &sub_repo, filter, gctx)?);
+                    files.extend(list_files_gix(pkg, &sub_repo, filter, shell)?);
                 }
                 Err(_) => {
-                    list_files_walk(&file_path, &mut files, false, filter, gctx)?;
+                    list_files_walk(&file_path, &mut files, false, filter, shell)?;
                 }
             }
         } else if (filter)(&file_path, is_dir) {
@@ -873,7 +901,7 @@ fn list_files_walk(
     ret: &mut Vec<PathEntry>,
     is_root: bool,
     filter: &dyn Fn(&Path, bool) -> bool,
-    gctx: &GlobalContext,
+    shell: &mut crate::Shell,
 ) -> CargoResult<()> {
     let walkdir = WalkDir::new(path)
         .follow_links(true)
@@ -947,7 +975,7 @@ fn list_files_walk(
                 }
             }
             Err(err) if err.loop_ancestor().is_some() => {
-                gctx.shell().warn(err)?;
+                shell.warn(err)?;
             }
             Err(err) => match err.path() {
                 // If an error occurs with a path, filter it again.
@@ -976,20 +1004,112 @@ fn last_modified_file(
     pkg: &Package,
     gctx: &GlobalContext,
 ) -> CargoResult<(FileTime, PathBuf)> {
-    let mut max = FileTime::zero();
-    let mut max_path = PathBuf::new();
-    for file in list_files(pkg, gctx).with_context(|| {
+    last_modified_file_excluding(path, pkg, gctx, None)
+}
+
+/// Legacy build-script freshness ignores only this build's actual output roots.
+/// Packaging keeps its existing file list; no directory-name heuristics apply.
+pub(crate) fn fingerprint_excluding(
+    pkg: &Package,
+    gctx: &GlobalContext,
+    output_roots: &[PathBuf],
+) -> CargoResult<String> {
+    PreparedPathFingerprint::new(pkg, output_roots).fingerprint(&mut gctx.shell())
+}
+
+/// Uses the already parsed manifest, without a worker-local GlobalContext.
+pub(crate) struct PreparedPathFingerprint {
+    pkg: FileListPackage,
+    output_roots: Vec<PathBuf>,
+}
+
+impl PreparedPathFingerprint {
+    pub fn new(pkg: &Package, output_roots: &[PathBuf]) -> Self {
+        Self {
+            pkg: FileListPackage::new(pkg),
+            output_roots: output_roots.to_vec(),
+        }
+    }
+
+    pub fn fingerprint(&self, shell: &mut crate::Shell) -> CargoResult<String> {
+        let pkg = &self.pkg;
+        let package_root = fs::canonicalize(pkg.root())
+            .with_context(|| format!("failed to resolve package root {}", pkg.root().display()))?;
+        let mut excluded = Vec::new();
+        for root in &self.output_roots {
+            match fs::canonicalize(root) {
+                Ok(root) if root != package_root && root.starts_with(&package_root) => {
+                    excluded.push(root);
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("failed to resolve output root {}", root.display())
+                    });
+                }
+            }
+        }
+        let files = pkg.list_files(shell)?;
+        let (max, path) = last_modified_from_files(pkg.root(), files, Some(&excluded))?;
+        let relative = path.strip_prefix(pkg.root()).unwrap_or(&path);
+        Ok(format!("{} ({})", max, relative.display()))
+    }
+}
+
+fn last_modified_file_excluding(
+    path: &Path,
+    pkg: &Package,
+    gctx: &GlobalContext,
+    excluded: Option<&[PathBuf]>,
+) -> CargoResult<(FileTime, PathBuf)> {
+    let files = list_files(pkg, gctx).with_context(|| {
         format!(
             "failed to determine the most recently modified file in {}",
             pkg.root().display()
         )
-    })? {
-        // An `fs::stat` error here is either because path is a
-        // broken symlink, a permissions error, or a race
-        // condition where this path was `rm`-ed -- either way,
-        // we can ignore the error and treat the path's `mtime`
-        // as `0`.
-        let mtime = paths::mtime(&file).unwrap_or_else(|_| FileTime::zero());
+    })?;
+    last_modified_from_files(path, files, excluded)
+}
+
+fn last_modified_from_files(
+    path: &Path,
+    files: Vec<PathEntry>,
+    excluded: Option<&[PathBuf]>,
+) -> CargoResult<(FileTime, PathBuf)> {
+    let mut max = FileTime::zero();
+    let mut max_path = PathBuf::new();
+    for file in files {
+        if let Some(excluded) = excluded {
+            match fs::canonicalize(&*file) {
+                Ok(real) if excluded.iter().any(|root| real.starts_with(root)) => continue,
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("failed to resolve source file {}", file.display())
+                    });
+                }
+            }
+        }
+        // Preserve Source's historical best-effort stat behavior. The shared
+        // planning/execution API instead distinguishes absent files from IO
+        // errors, so an unreadable source cannot silently become reusable.
+        let mtime = match paths::mtime(&file) {
+            Ok(mtime) => mtime,
+            Err(_) if excluded.is_none() => FileTime::zero(),
+            Err(error)
+                if error
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) =>
+            {
+                continue;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to stat source file {}", file.display()));
+            }
+        };
         // Break equal-mtime ties by path so filesystem iteration order does not
         // affect which file is recorded in the fingerprint.
         if mtime > max || (mtime == max && file.path.as_path() > max_path.as_path()) {

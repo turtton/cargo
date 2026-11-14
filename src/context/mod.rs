@@ -125,7 +125,7 @@ pub use path::ResolveTemplateError;
 mod target;
 pub use target::{TargetCfgConfig, TargetConfig};
 
-mod environment;
+pub(crate) mod environment;
 use environment::Env;
 
 mod schema;
@@ -939,6 +939,11 @@ impl GlobalContext {
     /// Helper primarily for testing.
     pub fn set_env(&mut self, env: HashMap<String, String>) {
         self.env = Env::from_map(env);
+    }
+
+    /// An owned snapshot for work executed outside the main thread.
+    pub(crate) fn env_snapshot(&self) -> environment::Env {
+        self.env.clone()
     }
 
     /// Returns all environment variables as an iterator,

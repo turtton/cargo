@@ -54,6 +54,7 @@ pub struct JobState<'a, 'gctx> {
     lock_manager: Arc<LockManager>,
 
     warning_handling: WarningHandling,
+    test_hook: crate::compiler::locking::TestHook,
 
     // Historical versions of Cargo made use of the `'a` argument here, so to
     // leave the door open to future refactorings keep it here.
@@ -68,6 +69,7 @@ impl<'a, 'gctx> JobState<'a, 'gctx> {
         rmeta_required: bool,
         lock_manager: Arc<LockManager>,
         warning_handling: WarningHandling,
+        test_hook: crate::compiler::locking::TestHook,
     ) -> Self {
         Self {
             id,
@@ -76,6 +78,7 @@ impl<'a, 'gctx> JobState<'a, 'gctx> {
             rmeta_required: Cell::new(rmeta_required),
             lock_manager,
             warning_handling,
+            test_hook,
             _marker: marker::PhantomData,
         }
     }
@@ -149,18 +152,33 @@ impl<'a, 'gctx> JobState<'a, 'gctx> {
     /// builds when required, and can be called at any time before a job ends.
     /// This should only be called once because a metadata file can only be
     /// produced once!
-    pub fn rmeta_produced(&self) {
+    pub fn rmeta_produced(&self) -> CargoResult<()> {
+        self.test_hook.event("MetadataProduced")?;
         self.rmeta_required.set(false);
         self.messages
             .push(Message::Finish(self.id, Artifact::Metadata, Ok(())));
+        Ok(())
     }
 
-    pub fn lock_exclusive(&self, lock: &LockKey) -> CargoResult<()> {
-        self.lock_manager.lock(lock)
+    pub fn unit_lock_status(&self, message: String) -> CargoResult<()> {
+        if let Some(dedupe) = self.output {
+            dedupe.gctx.shell().status("Blocking", message)?;
+        } else {
+            self.messages.push_bounded(Message::UnitLockStatus(message));
+        }
+        Ok(())
     }
 
-    pub fn downgrade_to_shared(&self, lock: &LockKey) -> CargoResult<()> {
-        self.lock_manager.downgrade_to_shared(lock)
+    pub(in crate::compiler) fn run_locked(
+        &self,
+        lock: &LockKey,
+        probe: crate::compiler::fingerprint::PreparedFreshnessProbe,
+        dirty: super::Work,
+        done: super::Work,
+        fresh: super::Work,
+    ) -> CargoResult<()> {
+        self.lock_manager
+            .run_locked(lock, probe, dirty, done, fresh, self)
     }
 
     pub fn on_section_timing_emitted(&self, section: SectionTiming) {
@@ -175,13 +193,28 @@ impl<'a, 'gctx> JobState<'a, 'gctx> {
 
     /// Drives a [`Job`] to finish. This ensures that a [`Message::Finish`] is
     /// sent even if our job panics.
-    pub(super) fn run_to_finish(self, job: Job) {
+    pub(super) fn run_to_finish(
+        self,
+        job: Job,
+        fingerprint: Option<Arc<crate::compiler::fingerprint::Fingerprint>>,
+    ) {
         let mut sender = FinishOnDrop {
             messages: &self.messages,
             id: self.id,
             result: None,
         };
         sender.result = Some(job.run(&self));
+        if sender.result.as_ref().unwrap().is_ok() {
+            if let Some(fingerprint) = fingerprint {
+                fingerprint.mark_completed();
+            }
+        }
+
+        if sender.result.as_ref().unwrap().is_ok() {
+            if let Err(error) = self.test_hook.event("JobCompleted") {
+                sender.result = Some(Err(error));
+            }
+        }
 
         // If the `rmeta_required` wasn't consumed but it was set
         // previously, then we either have:

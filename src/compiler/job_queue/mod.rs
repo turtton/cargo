@@ -359,6 +359,7 @@ enum Message {
     Run(JobId, String),
     Stdout(String),
     Stderr(String),
+    UnitLockStatus(String),
 
     // This is for general stderr output from subprocesses
     Diagnostic {
@@ -551,10 +552,17 @@ impl<'gctx> JobQueue<'gctx> {
             .take()
             .map(move |srv| srv.start(move |msg| messages.push(Message::FixDiagnostic(msg))));
 
-        thread::scope(move |scope| {
+        let locks = Arc::clone(&build_runner.lock_manager);
+        let result = thread::scope(move |scope| {
             let (result,) = state.drain_the_queue(build_runner, scope, &helper);
             result
-        })
+        });
+        // All workers and their child processes are finished before protection
+        // disappears. In particular, --keep-going cannot keep a lock cycle alive.
+        if result.is_err() {
+            locks.release_all();
+        }
+        result
     }
 }
 
@@ -590,7 +598,10 @@ impl<'gctx> DrainState<'gctx> {
         // The `pending_queue` is sorted in ascending priority order, and we
         // remove items from its end to schedule the highest priority items
         // sooner.
-        while self.has_extra_tokens() && !self.pending_queue.is_empty() {
+        while self.has_extra_tokens()
+            && !self.pending_queue.is_empty()
+            && !build_runner.lock_manager.is_cancelled()
+        {
             let (unit, job, _) = self.pending_queue.pop().unwrap();
             *self.counts.get_mut(&unit.pkg.package_id()).unwrap() -= 1;
             // Print out some nice progress information.
@@ -631,6 +642,9 @@ impl<'gctx> DrainState<'gctx> {
             }
             Message::Stdout(out) => {
                 writeln!(build_runner.bcx.gctx.shell().out(), "{}", out)?;
+            }
+            Message::UnitLockStatus(message) => {
+                build_runner.bcx.gctx.shell().status("Blocking", message)?;
             }
             Message::Stderr(err) => {
                 let mut shell = build_runner.bcx.gctx.shell();
@@ -827,7 +841,12 @@ impl<'gctx> DrainState<'gctx> {
         // must be handled in such a way that the loop is still allowed to
         // drain event messages.
         loop {
-            if errors.count == 0 || build_runner.bcx.build_config.keep_going {
+            if errors.count > 0 && !build_runner.bcx.build_config.keep_going {
+                build_runner.lock_manager.cancel();
+            }
+            if !build_runner.lock_manager.is_cancelled()
+                && (errors.count == 0 || build_runner.bcx.build_config.keep_going)
+            {
                 if let Err(e) = self.spawn_work_if_possible(build_runner, jobserver_helper, scope) {
                     self.handle_error(&mut build_runner.bcx.gctx.shell(), &mut errors, e);
                 }
@@ -1015,6 +1034,12 @@ impl<'gctx> DrainState<'gctx> {
         let lock_manager = build_runner.lock_manager.clone();
         let warning_handling = build_runner.bcx.gctx.warning_handling().unwrap_or_default();
 
+        let fingerprint = build_runner.fingerprints.get(unit).cloned();
+        let test_hook = crate::compiler::locking::TestHook::new(
+            build_runner,
+            unit,
+            &build_runner.files().build_unit_lock(unit),
+        );
         let doit = move |diag_dedupe| {
             let state = JobState::new(
                 id,
@@ -1023,8 +1048,9 @@ impl<'gctx> DrainState<'gctx> {
                 rmeta_required,
                 lock_manager,
                 warning_handling,
+                test_hook,
             );
-            state.run_to_finish(job);
+            state.run_to_finish(job, fingerprint);
         };
 
         match is_fresh {
