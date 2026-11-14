@@ -368,6 +368,8 @@ jobs:
           RELEASE: ${{ needs.publish.outputs.release }}
         run: |
           store="$RUNNER_TEMP/verify-store"
-          sudo env -i chroot "$store" "$CARGO_OUT/bin/cargo" -V | tee version.txt
+          mkdir -p "$store/tmp/home/.cargo"
+          chmod 700 "$store/tmp/home" "$store/tmp/home/.cargo"
+          sudo env -i HOME=/tmp/home CARGO_HOME=/tmp/home/.cargo chroot "$store" "$CARGO_OUT/bin/cargo" -V | tee version.txt
           grep -F "turtton/cargo $RELEASE," version.txt
           ! grep -q huacnlee version.txt
