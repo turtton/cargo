@@ -16,45 +16,20 @@
 # --no-check-sigs and --substitute-on-destination are not used, and a warning
 # that a setting was ignored fails the run.
 #
-# It runs under a bash and tools pinned to the nixpkgs revision of flake.lock,
-# not the runner's bash 3.2 and BSD tools (see the step in nix.yml):
-#
-#   rev=<the nixpkgs rev of flake.lock>; p=github:NixOS/nixpkgs/$rev
-#   NIXPKGS_REV=$rev VERIFY_NIX_BIN=$(dirname "$(command -v nix)") \
-#     nix shell $p#bash $p#coreutils $p#gnugrep $p#gnused $p#findutils $p#curl \
-#       -c bash nix/darwin-ci-verify.sh
+# It runs under the bash and tools of the nixpkgs revision of flake.lock, not the
+# runner's bash 3.2 and BSD tools: nix/run-pinned.sh nix/darwin-ci-verify.sh
 set -eo pipefail
 
-case "$BASH" in
-  /nix/store/*) ;;
-  *) echo "::error::run this script with the pinned bash (see nix.yml), not $BASH"; exit 1 ;;
-esac
-: "${NIXPKGS_REV:?the nixpkgs revision of flake.lock}"
-: "${VERIFY_NIX_BIN:?the directory of the nix of the runner}"
-# Only the pinned tools and the runner's nix (the client of its daemon).
-pinned="$(printf '%s' "$PATH" | tr ':' '\n' | grep '^/nix/store/' | paste -sd: -)"
-PATH="$pinned:$VERIFY_NIX_BIN"
-export PATH
-for tool in bash cat chmod curl grep head mkdir mktemp paste rm sed tee tr wc; do
-  found="$(command -v "$tool" || true)"
-  case "$found" in
-    /nix/store/*) ;;
-    *) echo "::error::$tool is not a pinned tool: '$found'"; exit 1 ;;
-  esac
-done
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=nix/pinned-env.sh
+source "$here/pinned-env.sh"
+# shellcheck source=nix/darwin-ci-lib.sh
+source "$here/darwin-ci-lib.sh"
 
 UPSTREAM_URL=https://cache.nixos.org
 UPSTREAM_KEY=cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
 work="$(mktemp -d "${RUNNER_TEMP:-/tmp}/verify-rehearsal.XXXXXX")"
 trap 'chmod -R u+w "$work" 2> /dev/null; rm -rf "$work"' EXIT
-
-no_ignored_setting() {
-  if grep -Eiq 'ignoring the (client|user)-specified setting|unknown setting' "$1"; then
-    echo "::error::Nix reported an ignored setting:"
-    grep -Ei 'ignoring the (client|user)-specified setting|unknown setting' "$1"
-    exit 1
-  fi
-}
 
 echo "== 1. a package of cache.nixos.org that the daemon does not have"
 # The nixpkgs the package is built from, by its locked revision.
@@ -64,9 +39,8 @@ case "$path" in
   /nix/store/????????????????????????????????-hello-*) ;;
   *) echo "::error::unexpected store path: $path"; exit 1 ;;
 esac
-if nix path-info --option substituters "" "$path" > "$work/daemon.log" 2>&1; then
-  echo "::error::the daemon already has $path"
-  exit 1
+if in_daemon "$path"; then
+  fail_ci "the daemon already has $path"
 fi
 echo "the daemon does not have it (as intended)"
 # Input-addressed: a content-addressed path would carry no signature check of
@@ -85,7 +59,7 @@ fi
 echo "== 2. fetch it into an empty local?root store and verify it there"
 store="$work/store"
 mkdir -p "$store"
-test "$(nix path-info --all --store "local?root=$store" | wc -l | tr -d ' ')" = 0
+assert_store_empty "local?root=$store"
 nix copy --from "$UPSTREAM_URL" --to "local?root=$store" \
   --option trusted-public-keys "$UPSTREAM_KEY" "$path" 2>&1 | tee "$work/fetch.log"
 no_ignored_setting "$work/fetch.log"
@@ -110,9 +84,8 @@ grep -Eiq 'lacks a (valid )?signature' "$work/negative.log" || {
   echo "::error::the copy failed, but not for a missing signature"
   exit 1
 }
-if nix path-info --option substituters "" "$path" > /dev/null 2>&1; then
-  echo "::error::the daemon has the path after the failed copy"
-  exit 1
+if in_daemon "$path"; then
+  fail_ci "the daemon has the path after the failed copy"
 fi
 echo "failed as expected: the signature is missing"
 
@@ -135,6 +108,7 @@ if nix copy --from "$UPSTREAM_URL" --to "local?root=$fake_store" \
 fi
 cat "$work/fake.log"
 no_ignored_setting "$work/fake.log"
+expect_missing "$work/fake.log" "$fake"
 echo "failed as expected"
 
 echo "optional step (cargo-deps expanded into a local?root store and verified) is not done: its paths carry no signature, and copying them without one needs --no-check-sigs"
