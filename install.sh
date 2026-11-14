@@ -1,4 +1,8 @@
 #!/bin/sh
+# turtton/cargo is distributed through Nix only (see README.md). This
+# upstream installer would download huacnlee/cargo releases, so it is disabled.
+printf "%s\n" "install.sh is disabled in turtton/cargo: install it with Nix (nix profile install github:turtton/cargo)." >&2
+exit 1
 # Install huacnlee/cargo in place of the rustup `cargo` proxy. No sudo required.
 #
 #   curl -fsSL https://huacnlee.github.io/cargo/install.sh | sh

@@ -4,6 +4,7 @@ use std::process::Command;
 
 fn main() {
     commit_info();
+    fork_release();
     windows_manifest();
     let target = input::target();
     output::rustc_env("RUST_HOST_TARGET", &target);
@@ -71,6 +72,25 @@ fn commit_info_from_rustc_source_tarball() -> Option<CommitInfo> {
         short_hash: parts.next()?,
         date: parts.next()?,
     })
+}
+
+/// Sets `CARGO_FORK_RELEASE`, the release of this fork shown by `cargo -V`.
+///
+/// `TURTTON_VERSION` at the repository root is the only place the release is
+/// written down: plain `cargo build`, CI and the Nix package all read it here
+/// instead of passing the variable around. An environment variable of the same
+/// name is ignored so that no build can disagree with the file.
+fn fork_release() {
+    const FILE: &str = "TURTTON_VERSION";
+    output::rerun_if_changed(FILE);
+    let content =
+        std::fs::read_to_string(FILE).unwrap_or_else(|e| panic!("cannot read {FILE}: {e}"));
+    let release = content.trim();
+    assert!(
+        !release.is_empty() && !release.contains(char::is_whitespace),
+        "{FILE} must hold one release such as 0.102.0-9-turtton.1"
+    );
+    output::rustc_env("CARGO_FORK_RELEASE", release);
 }
 
 fn commit_info() {

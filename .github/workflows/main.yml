@@ -1,9 +1,16 @@
-name: CI
+# The upstream (rust-lang/cargo) testsuite on every OS and channel. It takes
+# hours and runs on GitHub-hosted runners of several systems, so turtton/cargo
+# does not start it for every pull request: ci.yml runs the focused tests
+# there. This one runs when asked (workflow_dispatch) and for a release
+# candidate (a `release/**` branch or a `v*` tag).
+name: Full testsuite
 on:
-  merge_group:
-  pull_request:
+  workflow_dispatch:
+  push:
     branches:
-      - "**"
+      - "release/**"
+    tags:
+      - "v*"
 
 defaults:
   run:

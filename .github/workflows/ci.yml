@@ -1,0 +1,98 @@
+# Focused Linux checks that run for every pull request and for pushes to main.
+#
+# They cover what this fork changes (fork defaults, build-dir locking and
+# freshness, build scripts) in a few minutes. The upstream suite on every OS is
+# main.yml ("Full testsuite"), started by hand or for a release candidate.
+#
+# No secret is used here: the jobs also run for pull requests from forks.
+name: CI
+
+on:
+  pull_request:
+    # No branch filter: a pull request stacked on another branch is checked too.
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # The compiler the fork targets; the Nix package pins the same version.
+  RUST_TOOLCHAIN: 1.99.0
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_WARNINGS: deny
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+        with:
+          shared-key: linux-clippy
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo clippy --locked --workspace --all-targets --no-deps --keep-going
+
+  focused-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 1
+      CARGO_PROFILE_TEST_DEBUG: 1
+      # The i686 target and 32-bit libraries are not installed here; the full
+      # suite (main.yml) runs the cross-compile tests.
+      CFG_DISABLE_CROSS_TESTS: 1
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+        with:
+          shared-key: linux-focused-tests
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Library unit tests
+        run: cargo test --locked -p cargo --lib
+      # Substring filters of the testsuite: the fork defaults (which include
+      # the removal of the self-update), the build-dir locking and freshness
+      # logic, and the build scripts that read the build directory.
+      - name: Fork-specific testsuite modules
+        run: |
+          cargo test --locked -p cargo --test testsuite -- \
+            fork_defaults:: \
+            build_dir:: \
+            build_dir_fine_grain_locking:: \
+            build_dir_legacy:: \
+            freshness:: \
+            freshness_checksum:: \
+            freshness_mtime:: \
+            build_script:: \
+            build_script_env:: \
+            build_scripts_multiple::

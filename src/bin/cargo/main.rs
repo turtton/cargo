@@ -11,14 +11,10 @@ use std::path::{Path, PathBuf};
 
 mod cli;
 mod commands;
-mod self_update;
 
 use crate::command_prelude::*;
 
 fn main() {
-    if self_update::run_if_child() {
-        return;
-    }
     let _guard = setup_logger();
     raise_fd_limit();
     if !cargo::workspace::features::is_fork_defaults_opt_out() {
@@ -60,7 +56,6 @@ fn main() {
         let _token = cargo::util::job::setup();
         cli::main(&mut gctx)
     };
-    self_update::maybe_spawn(&gctx);
 
     match result {
         Err(e) => cargo::exit_with_error(e, &mut *gctx.shell()),
