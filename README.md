@@ -82,7 +82,7 @@ Check which cargo is active:
 
 ```console
 $ cargo -V
-cargo 1.101.0 (ea4e34c28 2026-10-29) (turtton/cargo 0.102.0-9-turtton.1, https://github.com/turtton/cargo)
+cargo 1.101.0 (ea4e34c28 2026-10-29) (turtton/cargo 0.102.0-9-turtton.2, https://github.com/turtton/cargo)
 ```
 
 `cargo +nightly` and `rust-toolchain.toml` keep working when rustup is
@@ -105,7 +105,7 @@ installed next to it.
 
 No workflow creates a GitHub release or publishes a site: the upstream release
 and website workflows were removed. A release is a `v<TURTTON_VERSION>` tag
-(for example `v0.102.0-9-turtton.1`) that the maintainer pushes by hand.
+(for example `v0.102.0-9-turtton.2`) that the maintainer pushes by hand.
 
 ## Results
 
