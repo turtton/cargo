@@ -255,6 +255,26 @@
             "/System/Library/Frameworks/SystemConfiguration.framework/Versions/A/SystemConfiguration"
             "/System/Library/Frameworks/Kerberos.framework/Versions/A/Kerberos"
           ];
+          # What the install check requires and forbids of the direct
+          # dependencies: libcurl (all-static does not make it static on macOS)
+          # and libiconv are the store libraries cargo links; the OpenSSL of
+          # the store never is a direct dependency, it is vendored.
+          darwinRequiredDeps = [
+            "^/nix/store/[^/]+/lib/libcurl[.0-9]*dylib$"
+            "^/nix/store/[^/]+/lib/libiconv[.0-9]*dylib$"
+          ];
+          darwinForbiddenDeps = [ "/lib(ssl|crypto)[.0-9]*dylib$" ];
+          # The same lists as data, for the job that verifies the published
+          # package on another runner (checks.<darwin>.macho-config).
+          darwinMachoConfig = pkgs.writeText "turtton-cargo-macho-config.json" (
+            builtins.toJSON {
+              systemLibs = darwinSystemLibs;
+              transitiveSystemLibs = darwinTransitiveSystemLibs;
+              minos = darwinMinVersion;
+              requiredDeps = darwinRequiredDeps;
+              forbiddenDeps = darwinForbiddenDeps;
+            }
+          );
           machoEnv = ''
             export MACHO_ALLOWED_SYSTEM_LIBS="${lib.concatStringsSep " " darwinSystemLibs}"
             export MACHO_TRANSITIVE_SYSTEM_LIBS="${lib.concatStringsSep " " darwinTransitiveSystemLibs}"
@@ -268,8 +288,8 @@
             # libcurl (all-static does not make it static on macOS) and libiconv
             # are the store libraries cargo links; the OpenSSL of the store
             # never is a direct dependency, it is vendored.
-            export MACHO_REQUIRED_DEPS='^/nix/store/[^/]+/lib/libcurl[.0-9]*dylib$ ^/nix/store/[^/]+/lib/libiconv[.0-9]*dylib$'
-            export MACHO_FORBIDDEN_DEPS='/lib(ssl|crypto)[.0-9]*dylib$'
+            export MACHO_REQUIRED_DEPS='${lib.concatStringsSep " " darwinRequiredDeps}'
+            export MACHO_FORBIDDEN_DEPS='${lib.concatStringsSep " " darwinForbiddenDeps}'
             export MACHO_VERBOSE=1
             bash ${./nix/check-macho.sh} "$cargo_bin"
 
@@ -498,6 +518,7 @@
           // lib.optionalAttrs isDarwin {
             macho-inspection = machoInspection;
             closure = darwinClosureCheck;
+            macho-config = darwinMachoConfig;
           };
         };
 

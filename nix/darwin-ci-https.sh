@@ -19,7 +19,10 @@
 # Written for the bash 3.2 and BSD tools of a stock macOS.
 set -eo pipefail
 
-cargo="$(cd "$(dirname "${1:?usage: darwin-ci-https.sh CARGO}")" && pwd)/$(basename "$1")"
+cargo_arg="${1:?usage: darwin-ci-https.sh CARGO}"
+cargo_dir="$(cd "$(dirname "$cargo_arg")" && pwd)" || { echo "::error::no directory for $cargo_arg"; exit 1; }
+cargo="$cargo_dir/$(basename "$cargo_arg")"
+[ -x "$cargo" ] || { echo "::error::$cargo is not an executable"; exit 1; }
 work="$(mktemp -d "${RUNNER_TEMP:-/tmp}/https.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 

@@ -119,9 +119,12 @@ Linux one in two ways that matter at run time:
 - `nix.yml`: builds the Nix package for x86_64-linux and runs its install
   check; `build-darwin` does the same for aarch64-darwin on macos-15 (no
   secret, cache.nixos.org only) and checks the Mach-O linkage. A pull request, from a fork or not, never gets a secret or the attic
-  cache. A push to `main` or a `v*` tag builds in a separate job, which also
+  cache; for Darwin it also rehearses the publish and verify steps against a
+  local cache (`verify-darwin-rehearsal`). A push to `main` or a `v*` tag builds in a separate job, which also
   pushes the closures to the attic cache, and a following job fetches them from
-  attic alone into an empty store. Those two jobs use the GitHub environment
+  attic and cache.nixos.org into an empty store. The same two jobs exist for
+  aarch64-darwin (`publish-darwin`, `verify-cache-darwin`, on macos-15); they do
+  not depend on the Linux ones. All use the GitHub environment
   `attic-publish` and its secrets `TS_OAUTH_CLIENT_ID`, `TS_OAUTH_SECRET` and
   `ATTIC_TOKEN`; without them they build and check only.
 - `main.yml` ("Full testsuite"): the upstream suite on every OS, started by
