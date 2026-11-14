@@ -285,6 +285,9 @@
             echo "== Mach-O: arm64, macOS ${darwinMinVersion}, system libraries and the allowed outputs only"
             ${machoEnv}
             export MACHO_SELF_OUT="$out"
+            # libcurl (all-static does not make it static on macOS) and libiconv
+            # are the store libraries cargo links; the OpenSSL of the store
+            # never is a direct dependency, it is vendored.
             export MACHO_REQUIRED_DEPS='${lib.concatStringsSep " " darwinRequiredDeps}'
             export MACHO_FORBIDDEN_DEPS='${lib.concatStringsSep " " darwinForbiddenDeps}'
             export MACHO_VERBOSE=1
