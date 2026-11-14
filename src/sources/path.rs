@@ -680,7 +680,7 @@ fn _list_files(pkg: &FileListPackage, shell: &mut crate::Shell) -> CargoResult<V
 /// (searched upwards from `root`) contains a tracked `<root>/Cargo.toml`.
 /// Otherwise, the caller should fall back on full file list.
 fn discover_gix_repo(root: &Path) -> CargoResult<Option<gix::Repository>> {
-    let repo = match gix::ThreadSafeRepository::discover(root) {
+    let mut repo = match gix::ThreadSafeRepository::discover(root) {
         Ok(repo) => repo.to_thread_local(),
         Err(e) => {
             tracing::debug!(
@@ -691,10 +691,69 @@ fn discover_gix_repo(root: &Path) -> CargoResult<Option<gix::Repository>> {
             return Ok(None);
         }
     };
+    // gix 0.90 caches core.bare before merging config.worktree. Detect the
+    // loaded worktree configuration even if it disables its own extension.
+    let config = repo.config_snapshot();
+    let worktree_config = config.boolean("extensions.worktreeConfig") == Some(true)
+        || config
+            .plumbing()
+            .sections()
+            .any(|section| section.meta().source == gix::config::Source::Worktree);
+    let bare = config.boolean("core.bare");
+    let configured_worktree = config
+        .plumbing()
+        .raw_value_with_section_filter("core.worktree", gix::config::section::is_trusted)
+        .ok()
+        .map(|(path, section)| (path, section.meta().source));
+    // GIT_WORK_TREE takes precedence over core.bare. gix has already resolved
+    // it, so do not override or reject the resulting workdir.
+    let worktree_from_environment = configured_worktree
+        .as_ref()
+        .is_some_and(|(_, source)| *source == gix::config::Source::EnvOverride);
+    let is_bare = worktree_config && bare == Some(true) && !worktree_from_environment;
+    if repo.workdir().is_none() && worktree_config && bare == Some(false) {
+        let workdir = match configured_worktree {
+            Some((path, source)) => {
+                anyhow::ensure!(!path.is_empty(), "core.worktree must not be empty");
+                let path = gix::path::from_bstr(path)?.into_owned();
+                // Match gix's normal open path: command/environment settings
+                // are relative to cwd, repository settings to the Git directory.
+                let path = match source {
+                    gix::config::Source::Env
+                    | gix::config::Source::Cli
+                    | gix::config::Source::Api
+                    | gix::config::Source::EnvOverride => repo.current_dir().join(path),
+                    _ => {
+                        let path = repo.path().join(path);
+                        // Resolve symlinks before interpreting `..`, but keep
+                        // logical paths when they name the same directory (for
+                        // example, a repository below a symlinked /tmp).
+                        let resolved = gix::path::realpath(&path)?;
+                        let same_directory =
+                            gix::path::normalize(path.as_path().into(), repo.current_dir())
+                                .and_then(|logical| gix::path::realpath(logical).ok())
+                                .is_some_and(|logical| logical == resolved);
+                        if same_directory { path } else { resolved }
+                    }
+                };
+                // Enumeration compares paths lexically, so .git/.. must not
+                // survive in the restored workdir.
+                gix::path::normalize(path.into(), repo.current_dir()).map(|p| p.into_owned())
+            }
+            None => {
+                gix::discover::upwards(root)?
+                    .0
+                    .into_repository_and_work_tree_directories()
+                    .1
+            }
+        };
+        repo.set_workdir(workdir)
+            .with_context(|| format!("failed to restore worktree for {}", repo.path().display()))?;
+    }
     let index = repo
         .index_or_empty()
         .with_context(|| format!("failed to open git index at {}", repo.path().display()))?;
-    let repo_root = repo.workdir().ok_or_else(|| {
+    let repo_root = repo.workdir().filter(|_| !is_bare).ok_or_else(|| {
         anyhow::format_err!(
             "did not expect repo at {} to be bare",
             repo.path().display()

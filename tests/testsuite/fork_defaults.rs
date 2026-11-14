@@ -3,7 +3,7 @@
 //! `__CARGO_FORK_DEFAULTS_OPT_OUT=1`; these tests remove it.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::prelude::*;
 use cargo_test_support::registry::Package;
@@ -15,6 +15,394 @@ fn fork_cargo(p: &Project, args: &str) -> Execs {
     let mut execs = p.cargo(args);
     execs.env_remove("__CARGO_FORK_DEFAULTS_OPT_OUT");
     execs
+}
+
+fn worktree_config_repo(extension: bool, worktree_config: Option<&str>) -> Project {
+    let p = git::new("foo", |p| {
+        p.file("src/lib.rs", "pub fn foo() {}")
+            .file(".gitignore", "ignored.txt\n")
+    });
+    fs::write(p.root().join("ignored.txt"), "not a build input").unwrap();
+    let config = p.root().join(".git/config");
+    let mut contents = fs::read_to_string(&config).unwrap();
+    contents.push_str(&format!(
+        "\n[core]\n\tbare = true\n[extensions]\n\tworktreeConfig = {extension}\n"
+    ));
+    fs::write(config, contents).unwrap();
+    if let Some(contents) = worktree_config {
+        fs::write(p.root().join(".git/config.worktree"), contents).unwrap();
+    }
+    p
+}
+
+fn git_is_bare(root: &Path, bare: bool) -> Execs {
+    let mut git = cargo_test_support::git_process("rev-parse --is-bare-repository");
+    git.cwd(root);
+    let mut execs = cargo_test_support::execs().with_process_builder(git);
+    execs.with_stdout_data(format!("{bare}\n").as_str());
+    execs
+}
+
+fn assert_package_files(cargo: &mut Execs, source: &str) {
+    cargo
+        .with_stdout_contains("Cargo.toml")
+        .with_stdout_contains(source)
+        .with_stdout_does_not_contain("ignored.txt")
+        .run();
+}
+
+#[cargo_test]
+fn git_worktree_config_overrides_bare() {
+    let p = worktree_config_repo(true, Some("[core]\n\tbare = false\n"));
+    git_is_bare(&p.root(), false).run();
+    assert_package_files(
+        &mut fork_cargo(&p, "package --list --allow-dirty"),
+        "src/lib.rs",
+    );
+    fork_cargo(&p, "build").run();
+    fork_cargo(&p, "check").run();
+    fs::write(p.root().join("ignored.txt"), "still not a build input").unwrap();
+    fork_cargo(&p, "build")
+        .with_stderr_data(str![[r#"
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn git_worktree_config_normal_repository() {
+    let p = git::new("foo", |p| {
+        p.file("src/lib.rs", "pub fn foo() {}")
+            .file(".gitignore", "ignored.txt\n")
+    });
+    git_is_bare(&p.root(), false).run();
+    assert_package_files(
+        &mut fork_cargo(&p, "package --list --allow-dirty"),
+        "src/lib.rs",
+    );
+    fork_cargo(&p, "build").run();
+    fork_cargo(&p, "check").run();
+    fs::write(p.root().join("ignored.txt"), "still not a build input").unwrap();
+    fork_cargo(&p, "build")
+        .with_stderr_data(str![[r#"
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn git_worktree_config_bare_without_override() {
+    let p = worktree_config_repo(true, None);
+    git_is_bare(&p.root(), true).run();
+    for command in ["build", "check"] {
+        fork_cargo(&p, command)
+            .with_status(101)
+            .with_stderr_contains("[..]did not expect repo at [..] to be bare")
+            .run();
+    }
+}
+
+#[cargo_test]
+fn git_worktree_config_disabled() {
+    let p = worktree_config_repo(false, Some("[core]\n\tbare = false\n"));
+    git_is_bare(&p.root(), true).run();
+    fork_cargo(&p, "build")
+        .with_status(101)
+        .with_stderr_contains("[..]did not expect repo at [..] to be bare")
+        .run();
+}
+
+#[cargo_test]
+fn git_worktree_config_still_bare() {
+    let p = worktree_config_repo(true, Some("[core]\n\tbare = true\n"));
+    git_is_bare(&p.root(), true).run();
+    fork_cargo(&p, "build")
+        .with_status(101)
+        .with_stderr_contains("[..]did not expect repo at [..] to be bare")
+        .run();
+}
+
+#[cargo_test]
+fn git_worktree_config_makes_repository_bare() {
+    let p = worktree_config_repo(true, Some("[core]\n\tbare = true\n"));
+    let config = p.root().join(".git/config");
+    let contents = fs::read_to_string(&config).unwrap() + "\n[core]\n\tbare = false\n";
+    fs::write(config, contents).unwrap();
+    git_is_bare(&p.root(), true).run();
+    for command in ["build", "check"] {
+        fork_cargo(&p, command)
+            .with_status(101)
+            .with_stderr_contains("[..]did not expect repo at [..] to be bare")
+            .run();
+    }
+}
+
+#[cargo_test]
+fn git_worktree_config_linked_worktree() {
+    let (p, wt) = repo_with_worktree("fn main() { bar::bar(); }");
+    let git_dir = git2::Repository::open(&wt).unwrap().path().to_path_buf();
+    let config = p.root().join(".git/config");
+    let original = fs::read_to_string(&config).unwrap();
+    let configure = |extension| {
+        fs::write(
+            &config,
+            format!(
+                "{original}\n[core]\n\tbare = true\n[extensions]\n\tworktreeConfig = {extension}\n"
+            ),
+        )
+        .unwrap();
+    };
+    configure(false);
+    git_is_bare(&wt, false).run();
+    fork_cargo(&p, "build").cwd(&wt).run();
+    fork_cargo(&p, "check").cwd(&wt).run();
+
+    // Enabling the extension makes the common bare value apply to linked
+    // worktrees too, unless overridden in their own config.worktree.
+    configure(true);
+    git_is_bare(&wt, true).run();
+    fork_cargo(&p, "build")
+        .cwd(&wt)
+        .with_status(101)
+        .with_stderr_contains("[..]did not expect repo at [..] to be bare")
+        .run();
+
+    fs::write(git_dir.join("config.worktree"), "[core]\n\tbare = false\n").unwrap();
+    git_is_bare(&wt, false).run();
+    fork_cargo(&p, "build").cwd(&wt).run();
+    fork_cargo(&p, "check").cwd(&wt).run();
+
+    fs::write(git_dir.join("config.worktree"), "[core]\n\tbare = true\n").unwrap();
+    git_is_bare(&wt, true).run();
+    fork_cargo(&p, "build")
+        .cwd(&wt)
+        .with_status(101)
+        .with_stderr_contains("[..]did not expect repo at [..] to be bare")
+        .run();
+}
+
+#[cargo_test]
+fn git_worktree_config_explicit_worktree() {
+    let p = worktree_config_repo(true, Some("[core]\n\tbare = false\n\tworktree = ..\n"));
+    git_is_bare(&p.root(), false).run();
+    assert_package_files(
+        &mut fork_cargo(&p, "package --list --allow-dirty"),
+        "src/lib.rs",
+    );
+    // A gitfile pointing at a separate Git directory must not make Cargo use
+    // the Git directory's parent as the worktree.
+    let git_dir = paths::root().join("separate.git");
+    fs::rename(p.root().join(".git"), &git_dir).unwrap();
+    fs::write(
+        p.root().join(".git"),
+        format!("gitdir: {}\n", git_dir.display()),
+    )
+    .unwrap();
+    fs::write(
+        git_dir.join("config.worktree"),
+        "[core]\n\tbare = false\n\tworktree = ../foo\n",
+    )
+    .unwrap();
+    git_is_bare(&p.root(), false).run();
+    assert_package_files(
+        &mut fork_cargo(&p, "package --list --allow-dirty"),
+        "src/lib.rs",
+    );
+    fork_cargo(&p, "build").run();
+    fork_cargo(&p, "check").run();
+    fs::write(p.root().join("ignored.txt"), "still not a build input").unwrap();
+    fork_cargo(&p, "build")
+        .with_stderr_data(str![[r#"
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn git_worktree_config_submodule() {
+    let p = git::new("foo", |p| p.file("src/lib.rs", "pub fn foo() {}"));
+    let sub = git::new("bar", |p| p.file("src/lib.rs", "pub fn bar() {}"));
+    let repository = git2::Repository::open(p.root()).unwrap();
+    git::add_submodule(&repository, sub.root().to_url().as_ref(), Path::new("sub"));
+    git::commit(&repository);
+    let mut git = cargo_test_support::git_process("submodule absorbgitdirs sub");
+    git.cwd(p.root());
+    cargo_test_support::execs().with_process_builder(git).run();
+    let root = p.root().join("sub");
+    let git_dir = git2::Repository::open(&root).unwrap().path().to_path_buf();
+    let config = git_dir.join("config");
+    let contents = fs::read_to_string(&config).unwrap()
+        + "\n[core]\n\tbare = true\n\tworktree = ../../../sub\n[extensions]\n\tworktreeConfig = true\n";
+    fs::write(config, contents).unwrap();
+    fs::write(git_dir.join("config.worktree"), "[core]\n\tbare = false\n").unwrap();
+    git_is_bare(&root, false).run();
+    fork_cargo(&p, "build").cwd(&root).run();
+    fork_cargo(&p, "check").cwd(&root).run();
+    assert_package_files(
+        fork_cargo(&p, "package --list --allow-dirty").cwd(&root),
+        "src/lib.rs",
+    );
+}
+
+#[cargo_test]
+fn git_worktree_config_environment_worktree() {
+    let p = worktree_config_repo(true, Some("[core]\n\tbare = true\n"));
+    git_is_bare(&p.root(), false)
+        .env("GIT_WORK_TREE", p.root())
+        .run();
+    for command in ["build", "check"] {
+        fork_cargo(&p, command).env("GIT_WORK_TREE", p.root()).run();
+    }
+    assert_package_files(
+        fork_cargo(&p, "package --list --allow-dirty").env("GIT_WORK_TREE", p.root()),
+        "src/lib.rs",
+    );
+}
+
+#[cargo_test]
+fn git_worktree_config_environment_linked_worktree() {
+    let (p, wt) = repo_with_worktree("fn main() { bar::bar(); }");
+    let config = p.root().join(".git/config");
+    let contents = fs::read_to_string(&config).unwrap()
+        + "\n[core]\n\tbare = true\n[extensions]\n\tworktreeConfig = true\n";
+    fs::write(config, contents).unwrap();
+    git_is_bare(&wt, false).env("GIT_WORK_TREE", &wt).run();
+    for command in ["build", "check"] {
+        fork_cargo(&p, command)
+            .cwd(&wt)
+            .env("GIT_WORK_TREE", &wt)
+            .run();
+    }
+    assert_package_files(
+        fork_cargo(&p, "package --list --allow-dirty")
+            .cwd(&wt)
+            .env("GIT_WORK_TREE", &wt),
+        "src/main.rs",
+    );
+}
+
+#[cargo_test]
+fn git_worktree_config_environment_relative_worktree() {
+    let p = worktree_config_repo(true, Some("[core]\n\tbare = false\n"));
+    git_is_bare(&p.root(), false)
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.worktree")
+        .env("GIT_CONFIG_VALUE_0", ".")
+        .run();
+    for command in ["build", "check", "package --list --allow-dirty"] {
+        let mut cargo = fork_cargo(&p, command);
+        cargo
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "core.worktree")
+            .env("GIT_CONFIG_VALUE_0", ".");
+        if command.starts_with("package") {
+            assert_package_files(&mut cargo, "src/lib.rs");
+        } else {
+            cargo.run();
+        }
+    }
+}
+
+#[cargo_test]
+fn git_worktree_config_empty_worktree() {
+    let p = worktree_config_repo(true, Some("[core]\n\tbare = false\n\tworktree = \"\"\n"));
+    let mut git = cargo_test_support::git_process("rev-parse --is-bare-repository");
+    git.cwd(p.root());
+    cargo_test_support::execs()
+        .with_process_builder(git)
+        .with_status(128)
+        .with_stderr_contains("fatal: cannot chdir to ''[..]")
+        .run();
+    fork_cargo(&p, "build")
+        .with_status(101)
+        .with_stderr_contains("[..]core.worktree[..]")
+        .run();
+}
+
+#[cargo_test]
+fn git_worktree_config_self_disabling() {
+    let p = worktree_config_repo(
+        true,
+        Some("[extensions]\n\tworktreeConfig = false\n[core]\n\tbare = false\n"),
+    );
+    git_is_bare(&p.root(), false).run();
+    fork_cargo(&p, "build").run();
+    assert_package_files(
+        &mut fork_cargo(&p, "package --list --allow-dirty"),
+        "src/lib.rs",
+    );
+    let config = p.root().join(".git/config");
+    let contents = fs::read_to_string(&config).unwrap() + "\n[core]\n\tbare = false\n";
+    fs::write(config, contents).unwrap();
+    fs::write(
+        p.root().join(".git/config.worktree"),
+        "[extensions]\n\tworktreeConfig = false\n[core]\n\tbare = true\n",
+    )
+    .unwrap();
+    git_is_bare(&p.root(), true).run();
+    fork_cargo(&p, "build")
+        .with_status(101)
+        .with_stderr_contains("[..]did not expect repo at [..] to be bare")
+        .run();
+}
+
+#[cargo_test]
+fn git_worktree_config_symlinked_git_dir() {
+    if !cargo_test_support::symlink_supported() {
+        return;
+    }
+    let p = worktree_config_repo(true, Some("[core]\n\tbare = false\n\tworktree = ../..\n"));
+    fs::create_dir(p.root().join("metadata")).unwrap();
+    fs::rename(p.root().join(".git"), p.root().join("metadata/repo.git")).unwrap();
+    p.symlink("metadata/repo.git", ".git");
+    fs::write(p.root().join(".gitignore"), "ignored.txt\nmetadata/\n").unwrap();
+    git_is_bare(&p.root(), false).run();
+    assert_package_files(
+        &mut fork_cargo(&p, "package --list --allow-dirty"),
+        "src/lib.rs",
+    );
+    fork_cargo(&p, "build").run();
+    fork_cargo(&p, "check").run();
+}
+
+#[cargo_test]
+fn git_worktree_config_symlinked_ancestor() {
+    if !cargo_test_support::symlink_supported() {
+        return;
+    }
+    let p = worktree_config_repo(true, Some("[core]\n\tbare = false\n\tworktree = ..\n"));
+    let alias = paths::root().join("alias");
+    p.symlink(p.root(), &alias);
+    git_is_bare(&alias, false).run();
+    let manifest = alias.join("Cargo.toml");
+    assert_package_files(
+        fork_cargo(&p, "package --list --allow-dirty --manifest-path").arg(&manifest),
+        "src/lib.rs",
+    );
+    fork_cargo(&p, "build --manifest-path").arg(&manifest).run();
+    fork_cargo(&p, "check --manifest-path").arg(&manifest).run();
+}
+
+#[cargo_test]
+fn git_worktree_config_gitfile() {
+    let p = worktree_config_repo(true, Some("[core]\n\tbare = false\n"));
+    let git_dir = paths::root().join("separate.git");
+    fs::rename(p.root().join(".git"), &git_dir).unwrap();
+    fs::write(
+        p.root().join(".git"),
+        format!("gitdir: {}\n", git_dir.display()),
+    )
+    .unwrap();
+    git_is_bare(&p.root(), false).run();
+    assert_package_files(
+        &mut fork_cargo(&p, "package --list --allow-dirty"),
+        "src/lib.rs",
+    );
+    fork_cargo(&p, "build").run();
+    fork_cargo(&p, "check").run();
 }
 
 /// The shared build-dir of the `foo` project.
