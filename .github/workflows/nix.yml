@@ -9,8 +9,9 @@
 #                           uses the public substituters only.
 #   workflow_dispatch       `build`; never publishes.
 #   push to main, v* tag    `publish`: build + install check, then push the
-#                           closures to attic; `verify-cache` then fetches them
-#                           from attic alone into an empty store. Only these
+#                           closures to attic; `verify-cache` then substitutes
+#                           them from attic and cache.nixos.org into an empty
+#                           store. Only these
 #                           two jobs use the GitHub environment `attic-publish`
 #                           (its secrets TS_OAUTH_CLIENT_ID, TS_OAUTH_SECRET and
 #                           ATTIC_TOKEN), and the environment's deployment
@@ -185,12 +186,21 @@ jobs:
             echo "attic-client=$(readlink -f result-attic)"
           } >> "$GITHUB_OUTPUT"
 
-  # Fetches what `publish` pushed from attic alone, into an empty store of
-  # another location than the one Nix itself runs from: the runner's own store
-  # holds only Nix (from cache.nixos.org) and takes no part in the check.
-  # `nix copy --from` talks to attic and nothing else, so a path or dependency
-  # that attic does not serve fails the job; cache.nixos.org and the flake are
-  # never consulted. The negative steps show that a missing path fails.
+  # Fetches what `publish` pushed into an empty store of another location than
+  # the one Nix itself runs from: the runner's own store holds only Nix (from
+  # cache.nixos.org) and takes no part in the check. Substitution may use attic
+  # and cache.nixos.org and nothing else (the flake is never consulted), the
+  # way a user of the flake gets the package.
+  #
+  # cache.nixos.org is needed because the attic client skips every path that
+  # carries a signature of an upstream cache (the cache's
+  # upstream_cache_key_names, cache.nixos.org-1): glibc and the other nixpkgs
+  # paths of the closure are not in attic, and `nix copy --from attic` of the
+  # closure fails on the first of them ("path '...-glibc-...' is not valid").
+  # What attic must serve is everything else: the paths cache.nixos.org does
+  # not have (the package, its dependencies, the patched attic client). The
+  # job checks those one by one. The negative steps show that a missing path
+  # fails.
   verify-cache:
     needs: publish
     if: needs.publish.outputs.pushed == 'true'
@@ -203,6 +213,9 @@ jobs:
       ATTIC_URL: https://attic.taile2777.ts.net/home
       ATTIC_HOST: attic.taile2777.ts.net
       ATTIC_KEY: home:00byWMpTTw/3xTntv8EF6LQmlWlR9RU5Tl0GVG5Vwn8=
+      # The upstream cache and its public key (the default of every Nix).
+      UPSTREAM_URL: https://cache.nixos.org
+      UPSTREAM_KEY: cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
     steps:
       - name: Connect to Tailscale
         uses: tailscale/github-action@780049a30b6ff5c378a9e7b389d15ece7a204888  # v4.1.3
@@ -213,7 +226,7 @@ jobs:
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24  # v31.11.1
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Substitute the closures from attic into an empty store
+      - name: Substitute the closures from attic and cache.nixos.org into an empty store
         env:
           ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
           CARGO_OUT: ${{ needs.publish.outputs.cargo }}
@@ -229,13 +242,19 @@ jobs:
           # The token is only in this file, read by this job's nix commands.
           (umask 077; printf 'machine %s password %s\n' "$ATTIC_HOST" "$ATTIC_TOKEN" > "$RUNNER_TEMP/netrc")
           mkdir -p "$store"
-          nixopts=(--option netrc-file "$RUNNER_TEMP/netrc" --option trusted-public-keys "$ATTIC_KEY" --option substituters "$ATTIC_URL")
+          nixopts=(
+            --option netrc-file "$RUNNER_TEMP/netrc"
+            --option trusted-public-keys "$ATTIC_KEY $UPSTREAM_KEY"
+            --option substituters "$ATTIC_URL $UPSTREAM_URL"
+          )
 
           echo "== the verify store starts empty"
           test "$(nix path-info --all --store "local?root=$store" | wc -l)" -eq 0
 
-          echo "== copy the closures from attic only"
-          nix copy -L --from "$ATTIC_URL" --to "local?root=$store" "${nixopts[@]}" "${roots[@]}"
+          # The log names the cache of every path. The store has no derivation,
+          # so a path that neither cache serves cannot be built instead.
+          echo "== substitute the closures from attic and cache.nixos.org only"
+          nix build -L --no-link --store "local?root=$store" "${nixopts[@]}" "${roots[@]}"
 
           echo "== every path of the closures is there and its content is intact"
           nix path-info --store "local?root=$store" --recursive "${roots[@]}" | tee closure.txt
@@ -246,28 +265,98 @@ jobs:
           nix store verify --store "local?root=$store" --no-trust --recursive "${roots[@]}"
           # Nothing but those closures was put there.
           test "$(nix path-info --all --store "local?root=$store" | sort | wc -l)" -eq "$(sort -u closure.txt | wc -l)"
-      # A check that cannot fail proves nothing. Both paths below are fetched
-      # with the same command as above, and both must fail: a path attic never
-      # had, and a path that only cache.nixos.org has.
-      - name: A path that attic does not serve fails
+
+          # Substituting from both caches cannot tell where a path came from.
+          # What cache.nixos.org does not have only attic can have served, and
+          # attic must have each of those paths.
+          echo "== which paths of the closures cache.nixos.org has"
+          # Asks for the narinfo itself. `nix path-info` says "is not valid" for
+          # an HTTP 401/403 as well as for a 404, so only the status can tell
+          # a path the cache does not have from a query that failed. Only a
+          # 404 means "not there"; a 200 must be the narinfo of this very path;
+          # every other answer (403, 5xx, no connection) is an error.
+          probe_upstream() {
+            local path="$1" name hash body code err
+            name="${path#/nix/store/}"
+            hash="${name%%-*}"
+            body="$(mktemp "$RUNNER_TEMP/narinfo.XXXXXX")"
+            if ! code="$(curl -sS --retry 5 --retry-delay 2 --retry-all-errors --connect-timeout 10 --max-time 60 \
+              -o "$body" -w '%{http_code}' "$UPSTREAM_URL/$hash.narinfo" 2>"$body.err")"; then
+              err="$(tr '\n' ' ' < "$body.err")"
+              printf 'error %s: %s\n' "$path" "$err"
+            elif [ "$code" = 404 ]; then
+              printf 'fork %s\n' "$path"
+            elif [ "$code" = 200 ] && grep -qxF "StorePath: $path" "$body"; then
+              printf 'upstream %s\n' "$path"
+            else
+              printf 'error %s: HTTP %s from %s/%s.narinfo\n' "$path" "$code" "$UPSTREAM_URL" "$hash"
+            fi
+            rm -f "$body" "$body.err"
+          }
+          export -f probe_upstream
+          export UPSTREAM_URL
+          # The inner shell expands $1, not this one.
+          # shellcheck disable=SC2016
+          sort -u closure.txt | xargs -P 16 -I{} bash -c 'probe_upstream "$1"' _ {} > classified.txt
+          if grep -q '^error ' classified.txt; then
+            grep '^error ' classified.txt >&2
+            echo "::error::could not ask $UPSTREAM_URL about every path"
+            exit 1
+          fi
+          echo "cache.nixos.org has $(grep -c '^upstream ' classified.txt) paths"
+          echo "only attic can have $(grep -c '^fork ' classified.txt) paths:"
+          sed -n 's/^fork //p' classified.txt | sort | tee fork.txt
+          # The roots are built by this repository and are in no other cache.
+          for p in "${roots[@]}"; do
+            grep -qxF "$p" fork.txt || { echo "::error::$p is in $UPSTREAM_URL" >&2; exit 1; }
+          done
+          echo "== attic has every one of them"
+          mapfile -t fork < fork.txt
+          nix path-info --store "$ATTIC_URL" --option netrc-file "$RUNNER_TEMP/netrc" "${fork[@]}" > /dev/null
+      # A check that cannot fail proves nothing. Each path below must fail to
+      # be fetched, with the same commands as above (the substitution of both
+      # caches, and attic alone):
+      #   - a path that neither cache has: the substitution above must not be
+      #     able to succeed on a path that is not there;
+      #   - a path that only cache.nixos.org has (glibc, from the closure just
+      #     checked): attic alone must not serve it. This is what the attic
+      #     client's skipping of upstream paths means, and why the check above
+      #     needs cache.nixos.org at all.
+      - name: A path that is missing fails
         run: |
-          nixopts=(--option netrc-file "$RUNNER_TEMP/netrc" --option trusted-public-keys "$ATTIC_KEY" --option substituters "$ATTIC_URL")
+          attic_opts=(--option netrc-file "$RUNNER_TEMP/netrc" --option trusted-public-keys "$ATTIC_KEY" --option substituters "$ATTIC_URL")
+          both_opts=(
+            --option netrc-file "$RUNNER_TEMP/netrc"
+            --option trusted-public-keys "$ATTIC_KEY $UPSTREAM_KEY"
+            --option substituters "$ATTIC_URL $UPSTREAM_URL"
+          )
           fail_to_copy() {
             local store="$RUNNER_TEMP/negative-store-$1"
             mkdir -p "$store"
-            if nix copy --from "$ATTIC_URL" --to "local?root=$store" "${nixopts[@]}" "$2"; then
+            if nix copy --from "$ATTIC_URL" --to "local?root=$store" "${attic_opts[@]}" "$2"; then
               echo "::error::attic served $2, which it must not have"
               exit 1
             fi
             echo "as expected, attic does not serve $2"
           }
-          echo "== a store path with a made-up hash"
-          fail_to_copy fake /nix/store/00000000000000000000000000000000-turtton-cargo-missing
-          echo "== a path of cache.nixos.org that attic does not have (the Nix of this runner)"
-          nix_out="$(readlink -f "$(command -v nix)")"
-          nix_out="${nix_out%%/bin/*}"
-          nix path-info --store https://cache.nixos.org "$nix_out"
-          fail_to_copy nixos "$nix_out"
+          fail_to_substitute() {
+            local store="$RUNNER_TEMP/negative-store-$1"
+            mkdir -p "$store"
+            if nix build --no-link --store "local?root=$store" "${both_opts[@]}" "$2"; then
+              echo "::error::a substituter served $2, which it must not have"
+              exit 1
+            fi
+            echo "as expected, neither cache serves $2"
+          }
+          fake=/nix/store/00000000000000000000000000000000-turtton-cargo-missing
+          echo "== a store path with a made-up hash, from attic alone"
+          fail_to_copy fake "$fake"
+          echo "== the same path, from attic and cache.nixos.org"
+          fail_to_substitute fake-both "$fake"
+          echo "== a path of cache.nixos.org that attic does not have (the glibc of the closure)"
+          glibc="$(sed -n 's/^upstream //p' classified.txt | grep -E -- '-glibc-[0-9][0-9.-]*$' | sort | head -n 1)"
+          test -n "$glibc" || { echo "::error::no upstream glibc in the closure" >&2; exit 1; }
+          fail_to_copy glibc "$glibc"
       - name: Remove the attic credential
         if: always()
         run: rm -f "$RUNNER_TEMP/netrc"
