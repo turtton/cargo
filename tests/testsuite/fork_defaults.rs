@@ -17,6 +17,142 @@ fn fork_cargo(p: &Project, args: &str) -> Execs {
     execs
 }
 
+fn worktree_config_repo(extension: bool, worktree_config: Option<&str>) -> Project {
+    let p = git::new("foo", |p| {
+        p.file("src/lib.rs", "pub fn foo() {}")
+            .file(".gitignore", "ignored.txt\n")
+    });
+    fs::write(p.root().join("ignored.txt"), "not a build input").unwrap();
+    let config = p.root().join(".git/config");
+    let mut contents = fs::read_to_string(&config).unwrap();
+    contents.push_str(&format!(
+        "\n[core]\n\tbare = true\n[extensions]\n\tworktreeConfig = {extension}\n"
+    ));
+    fs::write(config, contents).unwrap();
+    if let Some(contents) = worktree_config {
+        fs::write(p.root().join(".git/config.worktree"), contents).unwrap();
+    }
+    p
+}
+
+fn assert_git_bare(p: &Project, bare: bool) {
+    let mut git = cargo_test_support::git_process("rev-parse --is-bare-repository");
+    git.cwd(p.root());
+    cargo_test_support::execs()
+        .with_process_builder(git)
+        .with_stdout_data(format!("{bare}\n").as_str())
+        .run();
+}
+
+#[cargo_test]
+fn git_worktree_config_overrides_bare() {
+    let p = worktree_config_repo(true, Some("[core]\n\tbare = false\n"));
+    assert_git_bare(&p, false);
+    fork_cargo(&p, "build").run();
+    fork_cargo(&p, "check").run();
+    fs::write(p.root().join("ignored.txt"), "still not a build input").unwrap();
+    fork_cargo(&p, "build")
+        .with_stderr_data(str![[r#"
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn git_worktree_config_normal_repository() {
+    let p = git::new("foo", |p| {
+        p.file("src/lib.rs", "pub fn foo() {}")
+            .file(".gitignore", "ignored.txt\n")
+    });
+    assert_git_bare(&p, false);
+    fork_cargo(&p, "build").run();
+    fork_cargo(&p, "check").run();
+    fs::write(p.root().join("ignored.txt"), "still not a build input").unwrap();
+    fork_cargo(&p, "build")
+        .with_stderr_data(str![[r#"
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn git_worktree_config_bare_without_override() {
+    let p = worktree_config_repo(true, None);
+    assert_git_bare(&p, true);
+    for command in ["build", "check"] {
+        fork_cargo(&p, command)
+            .with_status(101)
+            .with_stderr_contains("[..]did not expect repo at [..] to be bare")
+            .run();
+    }
+}
+
+#[cargo_test]
+fn git_worktree_config_disabled() {
+    let p = worktree_config_repo(false, Some("[core]\n\tbare = false\n"));
+    assert_git_bare(&p, true);
+    fork_cargo(&p, "build")
+        .with_status(101)
+        .with_stderr_contains("[..]did not expect repo at [..] to be bare")
+        .run();
+}
+
+#[cargo_test]
+fn git_worktree_config_still_bare() {
+    let p = worktree_config_repo(true, Some("[core]\n\tbare = true\n"));
+    assert_git_bare(&p, true);
+    fork_cargo(&p, "build")
+        .with_status(101)
+        .with_stderr_contains("[..]did not expect repo at [..] to be bare")
+        .run();
+}
+
+#[cargo_test]
+fn git_worktree_config_explicit_worktree() {
+    let p = worktree_config_repo(true, Some("[core]\n\tbare = false\n\tworktree = ..\n"));
+    // A gitfile pointing at a separate Git directory must not make Cargo use
+    // the Git directory's parent as the worktree.
+    let git_dir = paths::root().join("separate.git");
+    fs::rename(p.root().join(".git"), &git_dir).unwrap();
+    fs::write(
+        p.root().join(".git"),
+        format!("gitdir: {}\n", git_dir.display()),
+    )
+    .unwrap();
+    fs::write(
+        git_dir.join("config.worktree"),
+        "[core]\n\tbare = false\n\tworktree = ../foo\n",
+    )
+    .unwrap();
+    assert_git_bare(&p, false);
+    fork_cargo(&p, "build").run();
+    fork_cargo(&p, "check").run();
+    fs::write(p.root().join("ignored.txt"), "still not a build input").unwrap();
+    fork_cargo(&p, "build")
+        .with_stderr_data(str![[r#"
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn git_worktree_config_gitfile() {
+    let p = worktree_config_repo(true, Some("[core]\n\tbare = false\n"));
+    let git_dir = paths::root().join("separate.git");
+    fs::rename(p.root().join(".git"), &git_dir).unwrap();
+    fs::write(
+        p.root().join(".git"),
+        format!("gitdir: {}\n", git_dir.display()),
+    )
+    .unwrap();
+    assert_git_bare(&p, false);
+    fork_cargo(&p, "build").run();
+    fork_cargo(&p, "check").run();
+}
+
 /// The shared build-dir of the `foo` project.
 fn shared_build_dir() -> PathBuf {
     let targets = paths::cargo_home().join("targets");

@@ -680,7 +680,7 @@ fn _list_files(pkg: &FileListPackage, shell: &mut crate::Shell) -> CargoResult<V
 /// (searched upwards from `root`) contains a tracked `<root>/Cargo.toml`.
 /// Otherwise, the caller should fall back on full file list.
 fn discover_gix_repo(root: &Path) -> CargoResult<Option<gix::Repository>> {
-    let repo = match gix::ThreadSafeRepository::discover(root) {
+    let mut repo = match gix::ThreadSafeRepository::discover(root) {
         Ok(repo) => repo.to_thread_local(),
         Err(e) => {
             tracing::debug!(
@@ -691,6 +691,32 @@ fn discover_gix_repo(root: &Path) -> CargoResult<Option<gix::Repository>> {
             return Ok(None);
         }
     };
+    // gix 0.90 caches core.bare before merging config.worktree, so it can
+    // discard the main worktree even though the effective configuration is
+    // non-bare. Only restore it when the enabled extension actually overrides
+    // that decision; a genuinely bare repository must still fail below.
+    if repo.workdir().is_none()
+        && repo.config_snapshot().boolean("extensions.worktreeConfig") == Some(true)
+        && repo.config_snapshot().boolean("core.bare") == Some(false)
+    {
+        let config = repo.config_snapshot();
+        let workdir = match config
+            .plumbing()
+            .string_filter("core.worktree", &mut gix::config::section::is_trusted)
+        {
+            // Git treats this as a literal path relative to the Git directory,
+            // not the file that supplied the configuration.
+            Some(path) => Some(repo.path().join(gix::path::from_bstr(path)?)),
+            None => {
+                gix::discover::upwards(root)?
+                    .0
+                    .into_repository_and_work_tree_directories()
+                    .1
+            }
+        };
+        repo.set_workdir(workdir)
+            .with_context(|| format!("failed to restore worktree for {}", repo.path().display()))?;
+    }
     let index = repo
         .index_or_empty()
         .with_context(|| format!("failed to open git index at {}", repo.path().display()))?;
