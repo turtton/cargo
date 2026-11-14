@@ -691,22 +691,44 @@ fn discover_gix_repo(root: &Path) -> CargoResult<Option<gix::Repository>> {
             return Ok(None);
         }
     };
-    // gix 0.90 caches core.bare before merging config.worktree, so it can
-    // discard the main worktree even though the effective configuration is
-    // non-bare. Only restore it when the enabled extension actually overrides
-    // that decision; a genuinely bare repository must still fail below.
-    if repo.workdir().is_none()
-        && repo.config_snapshot().boolean("extensions.worktreeConfig") == Some(true)
-        && repo.config_snapshot().boolean("core.bare") == Some(false)
-    {
-        let config = repo.config_snapshot();
-        let workdir = match config
+    // gix 0.90 caches core.bare before merging config.worktree. Detect the
+    // loaded worktree configuration even if it disables its own extension.
+    let config = repo.config_snapshot();
+    let worktree_config = config.boolean("extensions.worktreeConfig") == Some(true)
+        || config
             .plumbing()
-            .string_filter("core.worktree", &mut gix::config::section::is_trusted)
-        {
-            // Git treats this as a literal path relative to the Git directory,
-            // not the file that supplied the configuration.
-            Some(path) => Some(repo.path().join(gix::path::from_bstr(path)?)),
+            .sections()
+            .any(|section| section.meta().source == gix::config::Source::Worktree);
+    let bare = config.boolean("core.bare");
+    let configured_worktree = config
+        .plumbing()
+        .raw_value_with_section_filter("core.worktree", gix::config::section::is_trusted)
+        .ok()
+        .map(|(path, section)| (path, section.meta().source));
+    // GIT_WORK_TREE takes precedence over core.bare. gix has already resolved
+    // it, so do not override or reject the resulting workdir.
+    let worktree_from_environment = configured_worktree
+        .as_ref()
+        .is_some_and(|(_, source)| *source == gix::config::Source::EnvOverride);
+    let is_bare = worktree_config && bare == Some(true) && !worktree_from_environment;
+    if repo.workdir().is_none() && worktree_config && bare == Some(false) {
+        let workdir = match configured_worktree {
+            Some((path, source)) => {
+                anyhow::ensure!(!path.is_empty(), "core.worktree must not be empty");
+                let path = gix::path::from_bstr(path)?.into_owned();
+                // Match gix's normal open path: command/environment settings
+                // are relative to cwd, repository settings to the Git directory.
+                let path = match source {
+                    gix::config::Source::Env
+                    | gix::config::Source::Cli
+                    | gix::config::Source::Api
+                    | gix::config::Source::EnvOverride => repo.current_dir().join(path),
+                    _ => repo.path().join(path),
+                };
+                // Enumeration compares paths lexically, so .git/.. must not
+                // survive in the restored workdir.
+                gix::path::normalize(path.into(), repo.current_dir()).map(|p| p.into_owned())
+            }
             None => {
                 gix::discover::upwards(root)?
                     .0
@@ -720,11 +742,6 @@ fn discover_gix_repo(root: &Path) -> CargoResult<Option<gix::Repository>> {
     let index = repo
         .index_or_empty()
         .with_context(|| format!("failed to open git index at {}", repo.path().display()))?;
-    let config = repo.config_snapshot();
-    // With worktreeConfig enabled, Git also applies core.bare to linked
-    // worktrees. gix's cached classification can miss an effective true value.
-    let is_bare = config.boolean("extensions.worktreeConfig") == Some(true)
-        && config.boolean("core.bare") == Some(true);
     let repo_root = repo.workdir().filter(|_| !is_bare).ok_or_else(|| {
         anyhow::format_err!(
             "did not expect repo at {} to be bare",
