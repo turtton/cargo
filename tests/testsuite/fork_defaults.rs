@@ -3,7 +3,7 @@
 //! `__CARGO_FORK_DEFAULTS_OPT_OUT=1`; these tests remove it.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::prelude::*;
 use cargo_test_support::registry::Package;
@@ -35,9 +35,9 @@ fn worktree_config_repo(extension: bool, worktree_config: Option<&str>) -> Proje
     p
 }
 
-fn assert_git_bare(p: &Project, bare: bool) {
+fn assert_git_bare(root: &Path, bare: bool) {
     let mut git = cargo_test_support::git_process("rev-parse --is-bare-repository");
-    git.cwd(p.root());
+    git.cwd(root);
     cargo_test_support::execs()
         .with_process_builder(git)
         .with_stdout_data(format!("{bare}\n").as_str())
@@ -47,7 +47,7 @@ fn assert_git_bare(p: &Project, bare: bool) {
 #[cargo_test]
 fn git_worktree_config_overrides_bare() {
     let p = worktree_config_repo(true, Some("[core]\n\tbare = false\n"));
-    assert_git_bare(&p, false);
+    assert_git_bare(&p.root(), false);
     fork_cargo(&p, "build").run();
     fork_cargo(&p, "check").run();
     fs::write(p.root().join("ignored.txt"), "still not a build input").unwrap();
@@ -65,7 +65,7 @@ fn git_worktree_config_normal_repository() {
         p.file("src/lib.rs", "pub fn foo() {}")
             .file(".gitignore", "ignored.txt\n")
     });
-    assert_git_bare(&p, false);
+    assert_git_bare(&p.root(), false);
     fork_cargo(&p, "build").run();
     fork_cargo(&p, "check").run();
     fs::write(p.root().join("ignored.txt"), "still not a build input").unwrap();
@@ -80,7 +80,7 @@ fn git_worktree_config_normal_repository() {
 #[cargo_test]
 fn git_worktree_config_bare_without_override() {
     let p = worktree_config_repo(true, None);
-    assert_git_bare(&p, true);
+    assert_git_bare(&p.root(), true);
     for command in ["build", "check"] {
         fork_cargo(&p, command)
             .with_status(101)
@@ -92,7 +92,7 @@ fn git_worktree_config_bare_without_override() {
 #[cargo_test]
 fn git_worktree_config_disabled() {
     let p = worktree_config_repo(false, Some("[core]\n\tbare = false\n"));
-    assert_git_bare(&p, true);
+    assert_git_bare(&p.root(), true);
     fork_cargo(&p, "build")
         .with_status(101)
         .with_stderr_contains("[..]did not expect repo at [..] to be bare")
@@ -102,8 +102,67 @@ fn git_worktree_config_disabled() {
 #[cargo_test]
 fn git_worktree_config_still_bare() {
     let p = worktree_config_repo(true, Some("[core]\n\tbare = true\n"));
-    assert_git_bare(&p, true);
+    assert_git_bare(&p.root(), true);
     fork_cargo(&p, "build")
+        .with_status(101)
+        .with_stderr_contains("[..]did not expect repo at [..] to be bare")
+        .run();
+}
+
+#[cargo_test]
+fn git_worktree_config_makes_repository_bare() {
+    let p = worktree_config_repo(true, Some("[core]\n\tbare = true\n"));
+    let config = p.root().join(".git/config");
+    let contents = fs::read_to_string(&config).unwrap() + "\n[core]\n\tbare = false\n";
+    fs::write(config, contents).unwrap();
+    assert_git_bare(&p.root(), true);
+    for command in ["build", "check"] {
+        fork_cargo(&p, command)
+            .with_status(101)
+            .with_stderr_contains("[..]did not expect repo at [..] to be bare")
+            .run();
+    }
+}
+
+#[cargo_test]
+fn git_worktree_config_linked_worktree() {
+    let (p, wt) = repo_with_worktree("fn main() { bar::bar(); }");
+    let git_dir = git2::Repository::open(&wt).unwrap().path().to_path_buf();
+    let config = p.root().join(".git/config");
+    let original = fs::read_to_string(&config).unwrap();
+    let configure = |extension| {
+        fs::write(
+            &config,
+            format!(
+                "{original}\n[core]\n\tbare = true\n[extensions]\n\tworktreeConfig = {extension}\n"
+            ),
+        )
+        .unwrap();
+    };
+    configure(false);
+    assert_git_bare(&wt, false);
+    fork_cargo(&p, "build").cwd(&wt).run();
+    fork_cargo(&p, "check").cwd(&wt).run();
+
+    // Enabling the extension makes the common bare value apply to linked
+    // worktrees too, unless overridden in their own config.worktree.
+    configure(true);
+    assert_git_bare(&wt, true);
+    fork_cargo(&p, "build")
+        .cwd(&wt)
+        .with_status(101)
+        .with_stderr_contains("[..]did not expect repo at [..] to be bare")
+        .run();
+
+    fs::write(git_dir.join("config.worktree"), "[core]\n\tbare = false\n").unwrap();
+    assert_git_bare(&wt, false);
+    fork_cargo(&p, "build").cwd(&wt).run();
+    fork_cargo(&p, "check").cwd(&wt).run();
+
+    fs::write(git_dir.join("config.worktree"), "[core]\n\tbare = true\n").unwrap();
+    assert_git_bare(&wt, true);
+    fork_cargo(&p, "build")
+        .cwd(&wt)
         .with_status(101)
         .with_stderr_contains("[..]did not expect repo at [..] to be bare")
         .run();
@@ -126,7 +185,7 @@ fn git_worktree_config_explicit_worktree() {
         "[core]\n\tbare = false\n\tworktree = ../foo\n",
     )
     .unwrap();
-    assert_git_bare(&p, false);
+    assert_git_bare(&p.root(), false);
     fork_cargo(&p, "build").run();
     fork_cargo(&p, "check").run();
     fs::write(p.root().join("ignored.txt"), "still not a build input").unwrap();
@@ -148,7 +207,7 @@ fn git_worktree_config_gitfile() {
         format!("gitdir: {}\n", git_dir.display()),
     )
     .unwrap();
-    assert_git_bare(&p, false);
+    assert_git_bare(&p.root(), false);
     fork_cargo(&p, "build").run();
     fork_cargo(&p, "check").run();
 }

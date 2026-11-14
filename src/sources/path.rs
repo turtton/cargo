@@ -720,7 +720,12 @@ fn discover_gix_repo(root: &Path) -> CargoResult<Option<gix::Repository>> {
     let index = repo
         .index_or_empty()
         .with_context(|| format!("failed to open git index at {}", repo.path().display()))?;
-    let repo_root = repo.workdir().ok_or_else(|| {
+    let config = repo.config_snapshot();
+    // With worktreeConfig enabled, Git also applies core.bare to linked
+    // worktrees. gix's cached classification can miss an effective true value.
+    let is_bare = config.boolean("extensions.worktreeConfig") == Some(true)
+        && config.boolean("core.bare") == Some(true);
+    let repo_root = repo.workdir().filter(|_| !is_bare).ok_or_else(|| {
         anyhow::format_err!(
             "did not expect repo at {} to be bare",
             repo.path().display()
