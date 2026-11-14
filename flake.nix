@@ -23,9 +23,11 @@
       crane,
     }:
     let
-      # Add "aarch64-linux" (or a darwin system) here to build for it. Nothing
-      # below is specific to x86_64 except the install check's allow list,
-      # which names libraries by soname.
+      # "aarch64-linux" could be added here, but only after the install check's
+      # allow list is made per system: it names x86_64 glibc sonames. A darwin
+      # system is more work than adding it here: the install check below is
+      # glibc- and ELF-specific (readelf, sonames, glibc and libgcc_s store
+      # paths) and would need a Mach-O variant (otool) with its own allow list.
       systems = [ "x86_64-linux" ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f system nixpkgs.legacyPackages.${system});
 
@@ -121,6 +123,8 @@
           '';
 
           # Libraries a static-ish cargo may still load: glibc and libgcc_s.
+          # Linux/glibc only: ELF sonames of x86_64, and store paths that exist
+          # on Linux alone (pkgs.glibc). A darwin build needs its own list.
           allowedNeeded = "libc.so.6 libm.so.6 libgcc_s.so.1 libdl.so.2 libpthread.so.0 librt.so.1 libutil.so.1 ld-linux-x86-64.so.2";
           allowedStorePaths = [
             pkgs.glibc
@@ -209,7 +213,7 @@
           # out those stalls and still ends an upload whose peer is gone.
           # attic offers no setting for it, and --replace-fail stops the build
           # once upstream changes this builder. reqwest has the option on
-          # Linux only.
+          # Linux only, so this client is exposed on Linux only.
           atticClient = pkgs.attic-client.overrideAttrs (old: {
             postPatch = (old.postPatch or "") + ''
               substituteInPlace client/src/api/mod.rs --replace-fail \
