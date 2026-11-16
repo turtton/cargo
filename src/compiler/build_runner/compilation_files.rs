@@ -194,9 +194,17 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
         host: Layout,
         target: HashMap<CompileTarget, Layout>,
     ) -> CompilationFiles<'a, 'gctx> {
+        let shared_kinds = std::iter::once((CompileKind::Host, &host))
+            .chain(
+                target
+                    .iter()
+                    .map(|(kind, layout)| (CompileKind::Target(*kind), layout)),
+            )
+            .filter_map(|(kind, layout)| layout.shared_build_dir().map(|_| kind))
+            .collect();
         let mut metas = HashMap::default();
         for unit in &build_runner.bcx.roots {
-            metadata_of(unit, build_runner, &mut metas);
+            metadata_of(unit, build_runner, &shared_kinds, &mut metas);
         }
         let outputs = metas
             .keys()
@@ -868,13 +876,14 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
 fn metadata_of<'a>(
     unit: &Unit,
     build_runner: &BuildRunner<'_, '_>,
+    shared_kinds: &HashSet<CompileKind>,
     metas: &'a mut HashMap<Unit, Metadata>,
 ) -> &'a Metadata {
     if !metas.contains_key(unit) {
-        let meta = compute_metadata(unit, build_runner, metas);
+        let meta = compute_metadata(unit, build_runner, shared_kinds, metas);
         metas.insert(unit.clone(), meta);
         for dep in build_runner.unit_deps(unit) {
-            metadata_of(&dep.unit, build_runner, metas);
+            metadata_of(&dep.unit, build_runner, shared_kinds, metas);
         }
     }
     &metas[unit]
@@ -884,13 +893,14 @@ fn metadata_of<'a>(
 fn compute_metadata(
     unit: &Unit,
     build_runner: &BuildRunner<'_, '_>,
+    shared_kinds: &HashSet<CompileKind>,
     metas: &mut HashMap<Unit, Metadata>,
 ) -> Metadata {
     let bcx = &build_runner.bcx;
     let deps_metadata = build_runner
         .unit_deps(unit)
         .iter()
-        .map(|dep| *metadata_of(&dep.unit, build_runner, metas))
+        .map(|dep| *metadata_of(&dep.unit, build_runner, shared_kinds, metas))
         .collect::<Vec<_>>();
     let c_extra_filename = use_extra_filename(bcx, unit);
     let pkg_dir = use_pkg_dir(bcx, unit);
@@ -1029,20 +1039,33 @@ fn compute_metadata(
     let mut dep_unit_id_hashes = deps_metadata.iter().map(|m| m.unit_id).collect::<Vec<_>>();
     dep_unit_id_hashes.sort();
     dep_unit_id_hashes.hash(&mut unit_id_hasher);
+    // A shared directory cannot alternate between fingerprints just because
+    // its users see different absolute paths (for example a sandbox CARGO_HOME).
+    // Keep these inputs out of symbol metadata, but propagate them through
+    // dependency unit IDs, including compiled and executed build scripts.
+    let shared_paths = !unit.is_std
+        && if unit.pkg.package_id().source_id().is_path() {
+            bcx.ws.shared_build_dir_root().is_some()
+        } else {
+            shared_kinds.contains(&unit.kind)
+        };
+    if shared_paths {
+        hash_shared_paths(build_runner, unit, &mut unit_id_hasher);
+    }
     // Avoid trashing the caches on RUSTFLAGS changing via `unit_id`
     //
     // Limited to `unit_id` to help with reproducible build / PGO issues.
     let default = Vec::new();
     let extra_args = build_runner.bcx.extra_args_for(unit).unwrap_or(&default);
-    if !has_remap_path_prefix(&extra_args) {
+    if shared_paths || !has_remap_path_prefix(extra_args) {
         extra_args.hash(&mut unit_id_hasher);
     }
     if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
-        if !has_remap_path_prefix(&unit.rustdocflags) {
+        if shared_paths || !has_remap_path_prefix(&unit.rustdocflags) {
             unit.rustdocflags.hash(&mut unit_id_hasher);
         }
     } else {
-        if !has_remap_path_prefix(&unit.rustflags) {
+        if shared_paths || !has_remap_path_prefix(&unit.rustflags) {
             unit.rustflags.hash(&mut unit_id_hasher);
         }
     }
@@ -1058,6 +1081,45 @@ fn compute_metadata(
             && !unit.is_std
             && unit.pkg.package_id().source_id().is_path(),
         pkg_dir,
+    }
+}
+
+/// Path-sensitive inputs that must distinguish users of a shared unit directory.
+fn hash_shared_paths(build_runner: &BuildRunner<'_, '_>, unit: &Unit, hasher: &mut StableHasher) {
+    let bcx = &build_runner.bcx;
+    // Use exactly the argument fingerprint.path hashes, NOT its canonical path.
+    // Workspace sources normally stay relative, preserving worktree sharing.
+    util::path_args(bcx.ws, unit).0.hash(hasher);
+    let build_root = if unit.pkg.package_id().source_id().is_path() {
+        bcx.ws.build_dir().into_path_unlocked()
+    } else {
+        bcx.ws.shared_deps_dir().expect("shared dependency layout")
+    };
+    build_root.hash(hasher);
+    // Custom target JSON contents are already hashed, but rustc also sees the
+    // literal --target path (CompileKind::fingerprint_hash omits that path).
+    unit.kind.hash(hasher);
+    // These may appear in rustc arguments, generated remaps, or build-script
+    // output without changing rustc's version or the package's source identity.
+    bcx.target_data
+        .get_info(unit.kind)
+        .unwrap()
+        .sysroot
+        .hash(hasher);
+    let linker = if unit.target.for_host() && !bcx.gctx.target_applies_to_host().unwrap_or_default()
+    {
+        build_runner.compilation.host_linker()
+    } else {
+        build_runner.compilation.target_linker(unit.kind)
+    };
+    linker.hash(hasher);
+    unit.links_overrides.hash(hasher);
+    if !unit.profile.trim_paths.is_none() {
+        bcx.gctx
+            .get_env(trim_paths::WS_REMAP_ENV)
+            .ok()
+            .filter(|prefix| !prefix.is_empty())
+            .hash(hasher);
     }
 }
 

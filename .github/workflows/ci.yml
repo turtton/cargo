@@ -87,6 +87,7 @@ jobs:
         run: |
           cargo test --locked -p cargo --test testsuite -- \
             fork_defaults:: \
+            unit_lock_protocol:: \
             build_dir:: \
             build_dir_fine_grain_locking:: \
             build_dir_legacy:: \
@@ -124,6 +125,7 @@ jobs:
         run: |
           cargo test --locked -p cargo --test testsuite -- \
             fork_defaults:: \
+            unit_lock_protocol:: \
             build_dir:: \
             build_dir_fine_grain_locking:: \
             build_dir_legacy:: \
