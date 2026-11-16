@@ -1080,7 +1080,9 @@ fn compute_metadata(
         stable_filename: build_runner.shared_units.is_some()
             && !unit.is_std
             && unit.pkg.package_id().source_id().is_path(),
-        pkg_dir,
+        // Every shared mode needs the complete unit ID for fingerprints and
+        // locks, even when rustc/rustdoc must not receive -C extra-filename.
+        pkg_dir: pkg_dir || shared_paths,
     }
 }
 
@@ -1114,6 +1116,28 @@ fn hash_shared_paths(build_runner: &BuildRunner<'_, '_>, unit: &Unit, hasher: &m
     };
     linker.hash(hasher);
     unit.links_overrides.hash(hasher);
+    if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
+        // Documentation is emitted into the consumer's artifact tree, not the
+        // shared build tree. Its output path must not share a writer lock with
+        // another consumer whose local documentation has not been generated.
+        bcx.ws.target_dir().into_path_unlocked().hash(hasher);
+        bcx.build_config.intent.wants_doc_json_output().hash(hasher);
+        bcx.gctx.cli_unstable().rustdoc_depinfo.hash(hasher);
+        bcx.gctx.cli_unstable().rustdoc_mergeable_info.hash(hasher);
+    }
+    if (unit.mode.is_doc() || unit.mode.is_doc_scrape()) && bcx.gctx.cli_unstable().rustdoc_map {
+        if let Ok(map) = bcx.gctx.doc_extern_map() {
+            map.hash(hasher);
+            // std = "local" resolves against the host sysroot. Registry map
+            // names are resolved separately from a dependency's source ID.
+            bcx.target_data.info(CompileKind::Host).sysroot.hash(hasher);
+            let mut registries = map.registries.keys().collect::<Vec<_>>();
+            registries.sort_unstable();
+            for registry in registries {
+                bcx.gctx.get_registry_index(registry).ok().hash(hasher);
+            }
+        }
+    }
     if !unit.profile.trim_paths.is_none() {
         bcx.gctx
             .get_env(trim_paths::WS_REMAP_ENV)

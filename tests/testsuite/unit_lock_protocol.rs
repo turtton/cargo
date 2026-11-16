@@ -299,6 +299,41 @@ fn different_source_paths_do_not_conflict_with_retained_readers() {
     observer(&lock, false);
 }
 
+#[cargo_test]
+fn shared_docs_do_not_conflict_with_retained_readers() {
+    let (p, vendor, alias) = crate::fork_defaults::vendored_source_fixture();
+    let command = "doc -p bar --no-deps --offline";
+    crate::fork_defaults::vendored_source_cargo(&p, command, &vendor).run();
+    let other = project()
+        .at("other")
+        .file("Cargo.toml", &p.read_file("Cargo.toml"))
+        .file("src/main.rs", "fn main() {}")
+        .build();
+    let mut controller = Controller::new();
+    let holder = controller
+        .spawn(crate::fork_defaults::vendored_source_cargo(&p, command, &vendor).build_command());
+    let held = controller.until(holder.pid, "PlanningFresh", "bar", "compile");
+    let lock = held.lock();
+    observer(&lock, true);
+    for source in [&vendor, &alias] {
+        let second = controller.spawn(
+            crate::fork_defaults::vendored_source_cargo(&other, command, source).build_command(),
+        );
+        let pid = second.pid;
+        success(second.wait_with_reader_elapsed(&mut controller, 2_000));
+        observer(&lock, true);
+        assert!(
+            !controller
+                .history
+                .iter()
+                .any(|event| event["pid"] == pid && event["phase"] == "ConflictingReaders")
+        );
+    }
+    held.resume(0);
+    success(holder.wait(&mut controller));
+    observer(&lock, false);
+}
+
 #[expect(
     clippy::disallowed_methods,
     reason = "this observer intentionally exercises OS locks independently of Cargo guards"

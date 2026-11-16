@@ -88,6 +88,7 @@ jobs:
           cargo test --locked -p cargo --test testsuite -- \
             fork_defaults:: \
             unit_lock_protocol:: \
+            rustdoc_extern_html:: \
             build_dir:: \
             build_dir_fine_grain_locking:: \
             build_dir_legacy:: \
@@ -126,6 +127,7 @@ jobs:
           cargo test --locked -p cargo --test testsuite -- \
             fork_defaults:: \
             unit_lock_protocol:: \
+            rustdoc_extern_html:: \
             build_dir:: \
             build_dir_fine_grain_locking:: \
             build_dir_legacy:: \

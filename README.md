@@ -217,6 +217,10 @@ directories (2.3 GB and 0.4 GB) plus the shared dependencies (2.2 GB).
   canonicalized to force reuse. This prevents alternating fingerprints and
   conflicting-reader timeouts. Existing shared units rebuild once after this
   change; there is no pool migration.
+  Documentation units also distinguish the consumer's output directory,
+  output format and `doc.extern-map` settings. HTML is regenerated when a
+  different unit last wrote the same local crate documentation; repeating
+  the same settings is Fresh. Documentation is not a cross-project HTML cache.
 - **Your own crates are shared by worktrees too.** A workspace crate is keyed
   by the content of its files instead of the checkout it is in, so a new
   worktree of the same commit reuses every crate another worktree built, and

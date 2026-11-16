@@ -523,6 +523,7 @@ pub fn prepare_target(
         .ok_or_else(|| internal("missing package source"))?;
     source.verify(unit.pkg.package_id())?;
 
+    let doc_output_marker = shared_doc_output_marker(build_runner, unit);
     let write_fingerprint = if unit.mode.is_run_custom_build() {
         // For build scripts the `local` field of the fingerprint may change
         // while we're executing it. For example it could be in the legacy
@@ -557,7 +558,15 @@ pub fn prepare_target(
             write_fingerprint(&loc, &fingerprint)
         })
     } else {
-        Work::new(move |_| write_fingerprint(&loc, &fingerprint))
+        Work::new(move |_| {
+            if let Some(marker) = doc_output_marker {
+                // rustdoc removes the crate directory before writing HTML, so
+                // switching units (or a failed invocation) removes the old
+                // identity. Publish the new identity only after success.
+                paths::write(&marker, b"")?;
+            }
+            write_fingerprint(&loc, &fingerprint)
+        })
     };
 
     Ok(Job::new_dirty(write_fingerprint, dirty_reason))
@@ -1941,6 +1950,35 @@ fn calculate(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult
     Ok(fingerprint)
 }
 
+/// A shared fingerprint must also describe the HTML actually in this consumer's
+/// target/doc. Other unit IDs can overwrite the same crate directory. rustdoc
+/// removes it before running, invalidating this marker even on failure.
+fn shared_doc_output_marker(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> Option<PathBuf> {
+    let bcx = build_runner.bcx;
+    if !unit.mode.is_doc()
+        || unit.is_std
+        || bcx.build_config.intent.wants_doc_json_output()
+        || !matches!(
+            Completion::for_unit(build_runner, unit),
+            Completion::Reusable
+        )
+    {
+        return None;
+    }
+    let files = build_runner.files();
+    let shared = if unit.pkg.package_id().source_id().is_path() {
+        bcx.ws.shared_build_dir_root().is_some()
+    } else {
+        files.is_shared_unit(unit)
+    };
+    shared.then(|| {
+        files
+            .output_dir(unit)
+            .join(unit.target.crate_name())
+            .join(format!(".cargo-unit-{}", files.metadata(unit).unit_id()))
+    })
+}
+
 /// Calculate a fingerprint for a "normal" unit, or anything that's not a build
 /// script. This is an internal helper of [`calculate`], don't call directly.
 fn calculate_normal(
@@ -2005,6 +2043,7 @@ fn calculate_normal(
         .iter()
         .filter(|output| !matches!(output.flavor, FileFlavor::DebugInfo | FileFlavor::Auxiliary))
         .map(|output| output.path.clone())
+        .chain(shared_doc_output_marker(build_runner, unit))
         .collect();
 
     // Fill out a bunch more information that we'll be tracking typically

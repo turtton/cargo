@@ -521,20 +521,16 @@ fn shared_units_distinguish_source_path_spellings() {
     );
 }
 
-#[cargo_test]
-fn shared_units_distinguish_source_paths_in_one_home() {
-    if !cargo_test_support::symlink_supported() {
-        return;
-    }
+pub(super) fn vendored_source_fixture() -> (Project, PathBuf, PathBuf) {
     Package::new("bar", "1.0.0")
-        .file("src/lib.rs", "pub fn bar() {}")
+        .file("src/lib.rs", "pub fn bar() -> Option<()> { None }")
         .publish();
     let p = project()
         .file(
             "Cargo.toml",
             &(basic_manifest("foo", "0.1.0") + "\n[dependencies]\nbar='1'\n"),
         )
-        .file("src/main.rs", "fn main() { bar::bar(); }")
+        .file("src/main.rs", "fn main() { let _ = bar::bar(); }")
         .build();
     let vendor = paths::root().join("vendor");
     let alias = paths::root().join("vendor-alias");
@@ -542,15 +538,29 @@ fn shared_units_distinguish_source_paths_in_one_home() {
         .arg(&vendor)
         .run();
     p.symlink(&vendor, &alias);
+    (p, vendor, alias)
+}
+
+pub(super) fn vendored_source_cargo(p: &Project, args: &str, source: &Path) -> Execs {
+    let mut cargo = fork_cargo(p, args);
+    cargo
+        .arg("--config=source.crates-io.replace-with='vendored'")
+        .arg(format!(
+            "--config=source.vendored.directory={:?}",
+            source.to_str().unwrap()
+        ));
+    cargo
+}
+
+#[cargo_test]
+fn shared_units_distinguish_source_paths_in_one_home() {
+    if !cargo_test_support::symlink_supported() {
+        return;
+    }
+    let (p, vendor, alias) = vendored_source_fixture();
     let build = |source: &Path, fresh: bool| {
-        let mut cargo = fork_cargo(&p, "build -vv");
-        cargo
-            .arg("--config=source.crates-io.replace-with='vendored'")
-            .arg(format!(
-                "--config=source.vendored.directory={:?}",
-                source.to_str().unwrap()
-            ))
-            .with_stderr_does_not_contain("[..]the path to the source changed[..]");
+        let mut cargo = vendored_source_cargo(&p, "build -vv", source);
+        cargo.with_stderr_does_not_contain("[..]the path to the source changed[..]");
         if fresh {
             cargo
                 .with_stderr_contains("[FRESH] bar v1.0.0")
@@ -602,6 +612,212 @@ fn shared_units_hash_flags_even_with_remap() {
     assert_eq!(shared_source_unit_dirs("bar").len(), 2 * first.len());
     for flags in flags {
         build(flags, true);
+    }
+}
+
+#[cargo_test]
+fn shared_docs_distinguish_source_paths() {
+    if !cargo_test_support::symlink_supported() {
+        return;
+    }
+    let (p, vendor, alias) = vendored_source_fixture();
+    for source in [&vendor, &alias, &vendor, &alias] {
+        vendored_source_cargo(&p, "doc -p bar --no-deps -vv", source)
+            .with_stderr_does_not_contain("[..]the path to the source changed[..]")
+            .run();
+        vendored_source_cargo(&p, "doc -p bar --no-deps -vv", source)
+            .with_stderr_contains("[FRESH] bar v1.0.0")
+            .with_stderr_does_not_contain("[DOCUMENTING] [..]")
+            .run();
+    }
+    assert_eq!(shared_source_unit_dirs("bar").len(), 2);
+}
+
+#[cargo_test]
+fn shared_docs_hash_rustdocflags_even_with_remap() {
+    Package::new("bar", "1.0.0")
+        .file("src/lib.rs", "pub fn bar() {}")
+        .publish();
+    let p = project()
+        .file(
+            "Cargo.toml",
+            &(basic_manifest("foo", "0.1.0") + "\n[dependencies]\nbar='1'\n"),
+        )
+        .file("src/main.rs", "fn main() {}")
+        .build();
+    let headers = ["first", "second"].map(|name| {
+        let path = p.root().join(format!("{name}.html"));
+        fs::write(&path, format!("<!-- {name}-header -->")).unwrap();
+        (path, format!("<!-- {name}-header -->"))
+    });
+    for i in [0, 1, 0, 1] {
+        let flags = format!(
+            "--remap-path-prefix=/spell-{i}=/src --html-in-header={}",
+            headers[i].0.display()
+        );
+        for fresh in [false, true] {
+            let mut cargo = fork_cargo(&p, "doc -p bar --no-deps -vv");
+            cargo.env("RUSTDOCFLAGS", &flags);
+            if fresh {
+                cargo
+                    .with_stderr_contains("[FRESH] bar v1.0.0")
+                    .with_stderr_does_not_contain("[DOCUMENTING] [..]");
+            }
+            cargo.run();
+            assert!(
+                p.read_file("target/doc/bar/index.html")
+                    .contains(&headers[i].1)
+            );
+        }
+    }
+    assert_eq!(shared_source_unit_dirs("bar").len(), 2);
+}
+
+#[cargo_test]
+fn shared_docs_json_has_its_own_unit_directory() {
+    Package::new("bar", "1.0.0")
+        .file("src/lib.rs", "pub fn bar() {}")
+        .publish();
+    let p = project()
+        .file(
+            "Cargo.toml",
+            &(basic_manifest("foo", "0.1.0") + "\n[dependencies]\nbar='1'\n"),
+        )
+        .file("src/main.rs", "fn main() {}")
+        .build();
+    for json in [false, true, false, true] {
+        for fresh in [false, true] {
+            let mut cargo = fork_cargo(&p, "doc -p bar --no-deps -vv");
+            if json {
+                cargo
+                    .arg("--output-format=json")
+                    .arg("-Zunstable-options")
+                    .masquerade_as_nightly_cargo(&["rustdoc-output-format"])
+                    .env("RUSTC_BOOTSTRAP", "1");
+            }
+            if fresh {
+                cargo
+                    .with_stderr_contains("[FRESH] bar v1.0.0")
+                    .with_stderr_does_not_contain("[DOCUMENTING] [..]");
+            }
+            cargo.run();
+            if json {
+                let document: serde_json::Value =
+                    serde_json::from_str(&p.read_file("target/doc/bar.json")).unwrap();
+                assert!(document["index"].is_object());
+            } else {
+                assert!(p.root().join("target/doc/bar/index.html").is_file());
+            }
+        }
+    }
+    assert_eq!(shared_source_unit_dirs("bar").len(), 2);
+}
+
+#[cargo_test]
+fn shared_docs_hash_extern_map_and_keep_html_current() {
+    if !cargo_test_support::symlink_supported() {
+        return;
+    }
+    Package::new("baz", "1.0.0")
+        .file("src/lib.rs", "pub struct Baz;")
+        .publish();
+    Package::new("bar", "1.0.0")
+        .dep("baz", "1")
+        .file(
+            "src/lib.rs",
+            "pub struct Bar; pub fn bar() -> Option<baz::Baz> { None }",
+        )
+        .publish();
+    let p = project()
+        .file(
+            "Cargo.toml",
+            &(basic_lib_manifest("foo") + "\n[dependencies]\nbar='1'\n"),
+        )
+        .file("src/lib.rs", "pub fn foo() -> Option<bar::Bar> { None }")
+        .build();
+    let docs = paths::root().join("docs");
+    let alias = paths::root().join("docs-alias");
+    fs::create_dir(&docs).unwrap();
+    p.symlink(&docs, &alias);
+    let urls = [&docs, &alias].map(|path| url::Url::from_directory_path(path).unwrap().to_string());
+    // Check both shared dependency docs and workspace path docs. Repeating the
+    // same matrix with upstream-compatible layout must keep HTML current too.
+    for (package, dependency, item) in [("bar", "baz", "Baz"), ("foo", "bar", "Bar")] {
+        // Existing local dependency docs take precedence over extern roots.
+        // Each package case starts without the previous case's HTML.
+        let doc_dir = p.root().join("target/doc");
+        if doc_dir.exists() {
+            fs::remove_dir_all(doc_dir).unwrap();
+        }
+        for shared in [true, false] {
+            let mut units_seen = std::collections::BTreeSet::new();
+            for (std, registry) in [(0, 0), (1, 0), (1, 1), (0, 0)] {
+                for fresh in [false, true] {
+                    let mut cargo = fork_cargo(&p, "doc --lib --no-deps -vv -Zrustdoc-map");
+                    cargo
+                        .arg("-p")
+                        .arg(package)
+                        .masquerade_as_nightly_cargo(&["rustdoc-map"])
+                        .env("RUSTC_BOOTSTRAP", "1")
+                        .env("RUSTDOCFLAGS", "--extern-html-root-takes-precedence")
+                        .arg(format!("--config=doc.extern-map.std={:?}", urls[std]))
+                        .arg(format!(
+                            "--config=doc.extern-map.registries.crates-io={:?}",
+                            urls[registry]
+                        ));
+                    if shared {
+                        cargo.with_stderr_does_not_contain("[..]the config settings changed[..]");
+                    } else {
+                        cargo
+                            .env("__CARGO_FORK_DEFAULTS_OPT_OUT", "1")
+                            .env("CARGO_SHARED_DEPS", "0")
+                            .env("CARGO_SHARE_WORKSPACE_UNITS", "0");
+                    }
+                    if fresh {
+                        cargo
+                            .with_stderr_contains(format!("[FRESH] {package} v[..]"))
+                            .with_stderr_does_not_contain("[DOCUMENTING] [..]");
+                    }
+                    cargo.run();
+                    if shared {
+                        // Workspace GC may evict old revisions. Count actual
+                        // unit directories as they are used, not GC lock files.
+                        let root = if package == "foo" {
+                            shared_build_dir()
+                        } else {
+                            paths::cargo_home().join("targets/shared-deps")
+                        };
+                        units_seen.extend(
+                            fs::read_dir(root.join("debug/build").join(package))
+                                .unwrap()
+                                .map(|entry| entry.unwrap().path())
+                                .filter(|path| path.is_dir()),
+                        );
+                    }
+                    let html = p.read_file(&format!("target/doc/{package}/fn.{package}.html"));
+                    // Explicit precedence makes rustdoc honor the configured
+                    // std root rather than the sysroot's html_root_url attribute.
+                    assert!(
+                        html.contains(&format!("{}core/option/enum.Option.html", urls[std])),
+                        "{html}"
+                    );
+                    assert!(
+                        html.contains(&format!(
+                            "{}{dependency}/1.0.0/{dependency}/struct.{item}.html",
+                            urls[registry]
+                        )),
+                        "{html}"
+                    );
+                }
+            }
+            if shared {
+                assert_eq!(
+                    units_seen.len(),
+                    3,
+                    "std and registry map values must both distinguish doc units"
+                );
+            }
+        }
     }
 }
 

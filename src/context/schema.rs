@@ -187,7 +187,9 @@ fn default_crates_io_to_docs_rs<'de, D: serde::Deserializer<'de>>(
 impl hash::Hash for RustdocExternMap {
     fn hash<H: hash::Hasher>(&self, into: &mut H) {
         self.std.hash(into);
-        for (key, value) in &self.registries {
+        let mut registries = self.registries.iter().collect::<Vec<_>>();
+        registries.sort_unstable_by_key(|(name, _)| *name);
+        for (key, value) in registries {
             key.hash(into);
             value.hash(into);
         }
@@ -892,5 +894,27 @@ impl GlobalRegistryConfig {
             min_publish_age: None,
             _protocol: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extern_map_hash_ignores_registry_insertion_order() {
+        let entries = (0..64)
+            .map(|i| (format!("registry-{i}"), format!("file:///docs/{i}")))
+            .collect::<Vec<_>>();
+        let map = |registries| RustdocExternMap {
+            registries,
+            std: None,
+        };
+        let forward = map(entries.iter().cloned().collect());
+        let reverse = map(entries.into_iter().rev().collect());
+        assert_eq!(
+            crate::util::hash_u64(&forward),
+            crate::util::hash_u64(&reverse)
+        );
     }
 }
