@@ -211,6 +211,16 @@ directories (2.3 GB and 0.4 GB) plus the shared dependencies (2.2 GB).
   works. `cargo check`, clippy, rust-analyzer and `cargo doc` use the same
   builds instead of checking each dependency again: after a build, a check
   only looks at your own crates.
+  Sharing requires the same literal source paths and path-sensitive compiler
+  settings too. A sandbox and host that spell `CARGO_HOME` differently use
+  separate units even if their caches alias the same directory; paths are not
+  canonicalized to force reuse. This prevents alternating fingerprints and
+  conflicting-reader timeouts. Existing shared units rebuild once after this
+  change; there is no pool migration.
+  Documentation units also distinguish the consumer's output directory,
+  output format and `doc.extern-map` settings. HTML is regenerated when a
+  different unit last wrote the same local crate documentation; repeating
+  the same settings is Fresh. Documentation is not a cross-project HTML cache.
 - **Your own crates are shared by worktrees too.** A workspace crate is keyed
   by the content of its files instead of the checkout it is in, so a new
   worktree of the same commit reuses every crate another worktree built, and

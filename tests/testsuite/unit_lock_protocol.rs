@@ -174,6 +174,10 @@ impl Controller {
     }
 
     fn wait(&mut self, pid: u32) -> Exit {
+        self.wait_with_reader_elapsed(pid, 0)
+    }
+
+    fn wait_with_reader_elapsed(&mut self, pid: u32, reader_elapsed: u64) -> Exit {
         loop {
             if let Some(exit) = self.exits.remove(&pid) {
                 return exit;
@@ -181,7 +185,12 @@ impl Controller {
             match self.rx.recv().unwrap() {
                 Notice::Event(event) => {
                     self.history.push(event.data.clone());
-                    event.resume(0);
+                    let elapsed = if event.text("phase") == "ConflictingReaders" {
+                        reader_elapsed
+                    } else {
+                        0
+                    };
+                    event.resume(elapsed);
                 }
                 Notice::Exit(pid, exit) => {
                     self.exits.insert(pid, exit);
@@ -215,6 +224,13 @@ impl Build {
         self.watchdog.take().unwrap().join().unwrap();
         exit
     }
+
+    fn wait_with_reader_elapsed(mut self, controller: &mut Controller, elapsed: u64) -> Exit {
+        let exit = controller.wait_with_reader_elapsed(self.pid, elapsed);
+        self.worker.take().unwrap().join().unwrap();
+        self.watchdog.take().unwrap().join().unwrap();
+        exit
+    }
 }
 
 impl Drop for Build {
@@ -236,6 +252,86 @@ fn kill_group(pid: u32) {
 
 fn success(exit: Exit) {
     assert!(exit.status.success(), "{exit:?}");
+}
+
+#[cargo_test]
+fn different_source_paths_do_not_conflict_with_retained_readers() {
+    let (p, alias) = crate::fork_defaults::source_path_fixture();
+    let mut command = p.cargo("build -v");
+    command.env_remove("__CARGO_FORK_DEFAULTS_OPT_OUT").run();
+    // A different consumer avoids the per-project artifact-directory lock.
+    let other = project()
+        .at("other")
+        .file("Cargo.toml", &p.read_file("Cargo.toml"))
+        .file("src/main.rs", &p.read_file("src/main.rs"))
+        .build();
+    let mut controller = Controller::new();
+    let holder = controller.spawn(
+        p.cargo("build --offline")
+            .env_remove("__CARGO_FORK_DEFAULTS_OPT_OUT")
+            .build_command(),
+    );
+    // PlanningFresh is emitted only after acquiring SH; it remains retained
+    // until this Cargo exits, exactly like a long-running downstream compile.
+    let held = controller.until(holder.pid, "PlanningFresh", "registry_probe", "compile");
+    let lock = held.lock();
+    observer(&lock, true);
+    let second = controller.spawn(
+        other
+            .cargo("build --offline")
+            .env_remove("__CARGO_FORK_DEFAULTS_OPT_OUT")
+            .env("CARGO_HOME", alias)
+            .build_command(),
+    );
+    // Production's timeout is 1 second (Controller::spawn). If the old hash
+    // collides, the hook advances contention past it without a wall-clock wait.
+    let second_pid = second.pid;
+    success(second.wait_with_reader_elapsed(&mut controller, 2_000));
+    observer(&lock, true);
+    assert!(
+        !controller
+            .history
+            .iter()
+            .any(|event| { event["pid"] == second_pid && event["phase"] == "ConflictingReaders" })
+    );
+    held.resume(0);
+    success(holder.wait(&mut controller));
+    observer(&lock, false);
+}
+
+#[cargo_test]
+fn shared_docs_do_not_conflict_with_retained_readers() {
+    let (p, vendor, alias) = crate::fork_defaults::vendored_source_fixture();
+    let command = "doc -p bar --no-deps --offline";
+    crate::fork_defaults::vendored_source_cargo(&p, command, &vendor).run();
+    let other = project()
+        .at("other")
+        .file("Cargo.toml", &p.read_file("Cargo.toml"))
+        .file("src/main.rs", "fn main() {}")
+        .build();
+    let mut controller = Controller::new();
+    let holder = controller
+        .spawn(crate::fork_defaults::vendored_source_cargo(&p, command, &vendor).build_command());
+    let held = controller.until(holder.pid, "PlanningFresh", "bar", "compile");
+    let lock = held.lock();
+    observer(&lock, true);
+    for source in [&vendor, &alias] {
+        let second = controller.spawn(
+            crate::fork_defaults::vendored_source_cargo(&other, command, source).build_command(),
+        );
+        let pid = second.pid;
+        success(second.wait_with_reader_elapsed(&mut controller, 2_000));
+        observer(&lock, true);
+        assert!(
+            !controller
+                .history
+                .iter()
+                .any(|event| event["pid"] == pid && event["phase"] == "ConflictingReaders")
+        );
+    }
+    held.resume(0);
+    success(holder.wait(&mut controller));
+    observer(&lock, false);
 }
 
 #[expect(
