@@ -279,6 +279,7 @@ fn run_inner(build_runner: &BuildRunner<'_, '_>, build_start: SystemTime) -> Car
             && let Some(targets) = dir.parent()
         {
             collect_idle_projects(
+                gctx,
                 targets,
                 &[root.as_path(), dir.as_path()],
                 settings.shared_max_unused,
@@ -699,6 +700,7 @@ fn collect_orphan_outputs(
 /// created (with a `CACHEDIR.TAG`) are considered, and a project a running
 /// build has locked is skipped.
 fn collect_idle_projects(
+    gctx: &GlobalContext,
     targets: &Path,
     keep: &[&Path],
     max_unused: Duration,
@@ -718,7 +720,7 @@ fn collect_idle_projects(
         {
             continue;
         }
-        remove_project(targets, &dir, removed)?;
+        remove_project(gctx, targets, &dir, removed)?;
     }
     Ok(())
 }
@@ -739,7 +741,12 @@ fn last_project_use(dir: &Path) -> CargoResult<FileTime> {
 /// Removes a whole project build-dir unless a build holds one of its
 /// `<profile>/.cargo-build-lock`. It is first renamed away so that a build
 /// starting meanwhile gets a fresh, empty directory.
-fn remove_project(targets: &Path, dir: &Path, removed: &mut Removed) -> CargoResult<()> {
+fn remove_project(
+    gctx: &GlobalContext,
+    targets: &Path,
+    dir: &Path,
+    removed: &mut Removed,
+) -> CargoResult<()> {
     let mut _locks = Vec::new();
     for profile in profile_dirs(dir)? {
         let Ok(file) = fs::File::open(profile.join(".cargo-build-lock")) else {
@@ -754,6 +761,7 @@ fn remove_project(targets: &Path, dir: &Path, removed: &mut Removed) -> CargoRes
             Err(fs::TryLockError::Error(e)) => return Err(e.into()),
         }
     }
+    super::locking::TestHook::for_path(gctx, dir, "gc").event("ProjectGcCandidate")?;
     let size = cargo_util::du(dir, &[]).unwrap_or(0);
     let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let trash = targets.join(format!(".{name}{REMOVING_SUFFIX}{}", std::process::id()));
@@ -930,7 +938,7 @@ fn remove_dangling_out_link(gctx: &GlobalContext, link: &Path) -> CargoResult<()
     if link.extension().is_some() || !is_dangling_out_link(link)? {
         return Ok(());
     }
-    super::locking::TestHook::out_link_gc(gctx, link).event("OutLinkCandidate")?;
+    super::locking::TestHook::for_path(gctx, link, "gc").event("OutLinkCandidate")?;
     // The target may be visible only in the builder's mount namespace. Use
     // the builder's lock even if no lock file exists yet, without recreating
     // a removed parent directory. Never unlink this file: waiters may already
@@ -1204,7 +1212,14 @@ mod tests {
 
         let mut removed = Removed::default();
         let week = Duration::from_secs(7 * 24 * 3600);
-        collect_idle_projects(&tmp, &[current.as_path()], week, &mut removed).unwrap();
+        collect_idle_projects(
+            &GlobalContext::default().unwrap(),
+            &tmp,
+            &[current.as_path()],
+            week,
+            &mut removed,
+        )
+        .unwrap();
         drop(lock);
         let left = |d: &Path| d.exists();
         let result = (
