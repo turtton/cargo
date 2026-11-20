@@ -586,6 +586,13 @@ struct DepFingerprint {
     name: InternedString,
     /// Whether or not this dependency is flagged as a public dependency or not.
     public: bool,
+    /// Whether or not this dependency is an rmeta dependency or a "full"
+    /// dependency. In the case of an rmeta dependency our dependency edge only
+    /// requires the rmeta from what we depend on, so a freshness check that runs
+    /// while the dependency still produces its other outputs (pipelining)
+    /// must only look for the rmeta. Only the execution-time freshness probe
+    /// reads it; mtimes come from the dependency's `.timestamp` file.
+    only_requires_rmeta: bool,
     /// The dependency's fingerprint we recursively point to, containing all the
     /// other hash information we'd otherwise need.
     fingerprint: Arc<Fingerprint>,
@@ -771,6 +778,10 @@ impl<'de> Deserialize<'de> for DepFingerprint {
             pkg_id,
             name: name.into(),
             public,
+            // This field is never read since it's only used by the
+            // execution-time probe, which isn't used by fingerprints loaded
+            // from disk.
+            only_requires_rmeta: false,
             fingerprint: Arc::new(Fingerprint {
                 memoized_hash: Mutex::new(Some(hash)),
                 ..Fingerprint::new()
@@ -1197,9 +1208,15 @@ impl Fingerprint {
 
     /// The status of this unit's own outputs on disk right now, for dependents
     /// to compare against: the same facts [`Fingerprint::check_filesystem`]
-    /// derives for the unit, without looking at its inputs.
-    fn current_fs_status(&self) -> CargoResult<FsStatus> {
+    /// derives for the unit, without looking at its inputs. A dependent whose
+    /// edge only requires the rmeta (`only_requires_rmeta`) must not need the
+    /// other outputs: with pipelining it runs while they are still being
+    /// produced.
+    fn current_fs_status(&self, only_requires_rmeta: bool) -> CargoResult<FsStatus> {
         for output in &self.outputs {
+            if only_requires_rmeta && output.extension().is_none_or(|e| e != "rmeta") {
+                continue;
+            }
             if optional_file(fs::metadata(output), output)?.is_none() {
                 return Ok(FsStatus::Stale);
             }
@@ -1218,16 +1235,22 @@ impl Fingerprint {
         )
     }
 
-    fn execution_snapshot_inner(&self, cache: &mut HashMap<usize, Arc<Self>>) -> CargoResult<Self> {
+    fn execution_snapshot_inner(
+        &self,
+        cache: &mut HashMap<(usize, bool), Arc<Self>>,
+    ) -> CargoResult<Self> {
         let mut deps = self.deps.clone();
         for dep in &mut deps {
-            let key = Arc::as_ptr(&dep.fingerprint) as usize;
+            let key = (
+                Arc::as_ptr(&dep.fingerprint) as usize,
+                dep.only_requires_rmeta,
+            );
             if let Some(snapshot) = cache.get(&key) {
                 dep.fingerprint = Arc::clone(snapshot);
                 continue;
             }
             let mut snapshot = dep.fingerprint.execution_snapshot_inner(cache)?;
-            snapshot.fs_status = snapshot.current_fs_status()?;
+            snapshot.fs_status = snapshot.current_fs_status(dep.only_requires_rmeta)?;
             dep.fingerprint = Arc::new(snapshot);
             cache.insert(key, Arc::clone(&dep.fingerprint));
         }
@@ -1769,6 +1792,7 @@ impl hash::Hash for Fingerprint {
             name,
             public,
             fingerprint,
+            only_requires_rmeta: _, // static property, no need to hash
         } in deps
         {
             pkg_id.hash(h);
@@ -1781,7 +1805,11 @@ impl hash::Hash for Fingerprint {
 }
 
 impl DepFingerprint {
-    fn new(build_runner: &mut BuildRunner<'_, '_>, dep: &UnitDep) -> CargoResult<DepFingerprint> {
+    fn new(
+        build_runner: &mut BuildRunner<'_, '_>,
+        parent: &Unit,
+        dep: &UnitDep,
+    ) -> CargoResult<DepFingerprint> {
         let fingerprint = calculate(build_runner, &dep.unit)?;
         // We need to be careful about what we hash here. We have a goal of
         // supporting renaming a project directory and not rebuilding
@@ -1804,6 +1832,7 @@ impl DepFingerprint {
             name: dep.extern_crate_name,
             public: dep.public,
             fingerprint,
+            only_requires_rmeta: build_runner.only_requires_rmeta(parent, &dep.unit),
         })
     }
 }
@@ -1986,7 +2015,7 @@ fn calculate_normal(
         let mut deps = deps
             .into_iter()
             .filter(|dep| !dep.unit.target.is_bin() || dep.unit.artifact.is_true())
-            .map(|dep| DepFingerprint::new(build_runner, &dep))
+            .map(|dep| DepFingerprint::new(build_runner, unit, &dep))
             .collect::<CargoResult<Vec<_>>>()?;
         deps.sort_by(|a, b| a.pkg_id.cmp(&b.pkg_id));
         deps
@@ -2193,7 +2222,7 @@ See https://doc.rust-lang.org/cargo/reference/build-scripts.html#rerun-if-change
         // Create Vec since mutable build_runner is needed in closure.
         let deps = Vec::from(build_runner.unit_deps(unit));
         deps.into_iter()
-            .map(|dep| DepFingerprint::new(build_runner, &dep))
+            .map(|dep| DepFingerprint::new(build_runner, unit, &dep))
             .collect::<CargoResult<Vec<_>>>()?
     };
 
@@ -2749,6 +2778,7 @@ mod execution_tests {
             pkg_id: 0,
             name: "dep".into(),
             public: false,
+            only_requires_rmeta: false,
             fingerprint: Arc::new(dependency),
         });
         let snapshot = parent.execution_snapshot().unwrap();
@@ -2780,6 +2810,40 @@ mod execution_tests {
     }
 
     #[test]
+    fn rmeta_edge_does_not_need_the_other_outputs_of_the_dependency() {
+        let dir = tempfile::tempdir().unwrap();
+        let rmeta = dir.path().join("libdep.rmeta");
+        let rlib = dir.path().join("libdep.rlib");
+        let timestamp = dir.path().join("dep.timestamp");
+        fs::write(&rmeta, "metadata").unwrap();
+        fs::write(&timestamp, "").unwrap();
+        let mut dependency = Fingerprint::new();
+        dependency.outputs = vec![rmeta, rlib.clone()];
+        dependency.timestamp_file = Some(timestamp);
+        let dependency = Arc::new(dependency);
+        let edge = |only_requires_rmeta| {
+            let mut parent = Fingerprint::new();
+            parent.deps.push(DepFingerprint {
+                pkg_id: 0,
+                name: "dep".into(),
+                public: false,
+                only_requires_rmeta,
+                fingerprint: dependency.clone(),
+            });
+            parent.execution_snapshot().unwrap().deps[0]
+                .fingerprint
+                .fs_status
+                .up_to_date()
+        };
+        // The rlib is still being written: only a full edge needs it.
+        assert!(edge(true));
+        assert!(!edge(false));
+        fs::write(rlib, "library").unwrap();
+        assert!(edge(true));
+        assert!(edge(false));
+    }
+
+    #[test]
     fn completed_pipelined_parent_does_not_hide_an_unfinished_dependency() {
         let dependency = Arc::new(Fingerprint::new());
         let mut middle = Fingerprint::new();
@@ -2787,6 +2851,7 @@ mod execution_tests {
             pkg_id: 0,
             name: "dependency".into(),
             public: false,
+            only_requires_rmeta: true,
             fingerprint: dependency.clone(),
         });
         middle.mark_completed();
@@ -2795,6 +2860,7 @@ mod execution_tests {
             pkg_id: 1,
             name: "middle".into(),
             public: false,
+            only_requires_rmeta: true,
             fingerprint: Arc::new(middle),
         });
         assert!(!root.dependencies_completed());
