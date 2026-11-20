@@ -710,7 +710,9 @@ fn collect_idle_projects(
         let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
         // Left over from a removal that was interrupted.
         if name.starts_with('.') && name.contains(REMOVING_SUFFIX) {
-            let _ = paths::remove_dir_all(&dir);
+            if let Some(_lock) = super::locking::try_lock_project(&dir)? {
+                let _ = paths::remove_dir_all(&dir);
+            }
             continue;
         }
         if name.starts_with('.')
@@ -738,19 +740,28 @@ fn last_project_use(dir: &Path) -> CargoResult<FileTime> {
     Ok(last)
 }
 
-/// Removes a whole project build-dir unless a build holds one of its
-/// `<profile>/.cargo-build-lock`. It is first renamed away so that a build
-/// starting meanwhile gets a fresh, empty directory.
+/// Project EX protects profiles that do not exist in a directory snapshot yet.
+/// Builders opened before rename recheck their lock inode before creating a
+/// profile; new builders get a fresh, empty directory.
 fn remove_project(
     gctx: &GlobalContext,
     targets: &Path,
     dir: &Path,
     removed: &mut Removed,
 ) -> CargoResult<()> {
+    let hook = super::locking::TestHook::for_path(gctx, dir, "gc");
+    hook.event("ProjectGcCandidate")?;
+    let Some(_project_lock) = super::locking::try_lock_project(dir)? else {
+        return Ok(());
+    };
+    hook.event("ProjectGcAcquired")?;
+    // Keep the old profile checks as well, but never wait while holding EX.
     let mut _locks = Vec::new();
     for profile in profile_dirs(dir)? {
-        let Ok(file) = fs::File::open(profile.join(".cargo-build-lock")) else {
-            continue;
+        let file = match fs::File::open(profile.join(".cargo-build-lock")) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
         };
         match flock::try_lock_exclusive(&file) {
             Ok(()) => _locks.push(file),
@@ -761,21 +772,16 @@ fn remove_project(
             Err(fs::TryLockError::Error(e)) => return Err(e.into()),
         }
     }
-    super::locking::TestHook::for_path(gctx, dir, "gc").event("ProjectGcCandidate")?;
     let size = cargo_util::du(dir, &[]).unwrap_or(0);
     let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let trash = targets.join(format!(".{name}{REMOVING_SUFFIX}{}", std::process::id()));
     debug!("build.gc removing idle project {}", dir.display());
-    // Windows cannot rename a directory with open files, the lock files here.
-    let renamed = fs::rename(dir, &trash).or_else(|_| {
-        _locks.clear();
-        fs::rename(dir, &trash)
-    });
-    if let Err(e) = renamed {
+    // Never drop protection to retry a rename (including on Windows).
+    // Skipping collection is preferable to deleting an active build root.
+    if let Err(e) = fs::rename(dir, &trash) {
         debug!("build.gc skipping {}: {e}", dir.display());
         return Ok(());
     }
-    drop(_locks);
     paths::remove_dir_all(&trash)?;
     removed.projects += 1;
     removed.bytes += size;

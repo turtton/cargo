@@ -393,6 +393,7 @@ fn build_dir_ignored_path_patterns() -> Vec<String> {
         // Coordination is exercised by the unit-lock protocol tests rather
         // than duplicated in every artifact-layout snapshot.
         "[..]/.cargo-unit-write-lock",
+        "[..]/.cargo-project-gc-lock",
     ]
     .into_iter()
     .map(ToString::to_string)
