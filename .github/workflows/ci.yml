@@ -82,8 +82,7 @@ jobs:
         run: cargo test --locked -p cargo --lib
       # Substring filters of the testsuite: the fork defaults (which include
       # the removal of the self-update), the build-dir locking and freshness
-      # logic, package clean with retained coordination locks, and the build
-      # scripts that read the build directory.
+      # logic, and the build scripts that read the build directory.
       - name: Fork-specific testsuite modules
         run: |
           cargo test --locked -p cargo --test testsuite -- \
@@ -93,14 +92,19 @@ jobs:
             build_dir:: \
             build_dir_fine_grain_locking:: \
             build_dir_legacy:: \
-            clean:: \
-            clean_legacy_layout:: \
             freshness:: \
             freshness_checksum:: \
             freshness_mtime:: \
             build_script:: \
             build_script_env:: \
             build_scripts_multiple::
+      # Exact names avoid also selecting the unrelated cargo_clean CLI help
+      # snapshots through libtest's substring filters.
+      - name: Package clean retains project coordination
+        run: |
+          cargo test --locked -p cargo --test testsuite -- --exact \
+            clean::package_cleans_all_the_things \
+            clean_legacy_layout::package_cleans_all_the_things
 
   # The same focused tests on macOS (macos-15, arm64), with the upstream cargo
   # that rustup installs as the driver. Informational for now: a failure is
@@ -134,11 +138,14 @@ jobs:
             build_dir:: \
             build_dir_fine_grain_locking:: \
             build_dir_legacy:: \
-            clean:: \
-            clean_legacy_layout:: \
             freshness:: \
             freshness_checksum:: \
             freshness_mtime:: \
             build_script:: \
             build_script_env:: \
             build_scripts_multiple::
+      - name: Package clean retains project coordination
+        run: |
+          cargo test --locked -p cargo --test testsuite -- --exact \
+            clean::package_cleans_all_the_things \
+            clean_legacy_layout::package_cleans_all_the_things
