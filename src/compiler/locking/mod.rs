@@ -7,13 +7,13 @@
 
 use crate::compiler::fingerprint::PreparedFreshnessProbe;
 use crate::compiler::job_queue::{JobState, Work};
-use crate::util::data_structures::HashMap;
 use crate::util::{FileLock, Filesystem, flock};
 use crate::{
     CargoResult,
     compiler::{BuildRunner, Unit},
 };
 use anyhow::{Context as _, bail};
+use cargo_util::collections::HashMap;
 use rand::RngExt as _;
 use std::fmt::{Display, Formatter};
 use std::fs::{File, OpenOptions, TryLockError};
