@@ -52,8 +52,8 @@ impl TestHook {
         }
     }
 
-    /// GC has no build unit; report the candidate path through the same barrier.
-    pub fn out_link_gc(gctx: &GlobalContext, path: &Path) -> Self {
+    /// Layout/GC have no build unit; report their paths through the same barrier.
+    pub fn for_path(gctx: &GlobalContext, path: &Path, mode: &'static str) -> Self {
         #[cfg(all(unix, debug_assertions))]
         {
             let data = gctx
@@ -64,14 +64,14 @@ impl TestHook {
                         path: path.into(),
                         package: String::new(),
                         target: String::new(),
-                        mode: "gc",
+                        mode,
                     })
                 });
             Self { data }
         }
         #[cfg(not(all(unix, debug_assertions)))]
         {
-            let _ = (gctx, path);
+            let _ = (gctx, path, mode);
             Self::default()
         }
     }

@@ -316,6 +316,7 @@ fn run_inner(build_runner: &BuildRunner<'_, '_>, build_start: SystemTime) -> Car
             && let Some(targets) = dir.parent()
         {
             collect_idle_projects(
+                gctx,
                 targets,
                 &[root.as_path(), dir.as_path()],
                 &settings,
@@ -775,6 +776,7 @@ fn collect_foreign_outputs(
 /// (with a `CACHEDIR.TAG`) are considered, and a project a running build has
 /// locked is never removed whole.
 fn collect_idle_projects(
+    gctx: &GlobalContext,
     targets: &Path,
     keep: &[&Path],
     settings: &GcSettings,
@@ -785,7 +787,9 @@ fn collect_idle_projects(
         let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
         // Left over from a removal that was interrupted.
         if name.starts_with('.') && name.contains(REMOVING_SUFFIX) {
-            let _ = paths::remove_dir_all(&dir);
+            if let Some(_lock) = super::locking::try_lock_project(&dir)? {
+                let _ = paths::remove_dir_all(&dir);
+            }
             continue;
         }
         if name.starts_with('.')
@@ -796,7 +800,7 @@ fn collect_idle_projects(
         }
         let idle = age(last_project_use(&dir)?);
         if idle > settings.shared_max_unused {
-            remove_project(targets, &dir, removed)?;
+            remove_project(gctx, targets, &dir, removed)?;
             continue;
         }
         if idle > settings.max_unused {
@@ -825,12 +829,21 @@ fn collect_idle_projects(
         "project build-dirs are {total} bytes (limit {max_size}), \
          disk short of {short_of_free} free bytes"
     );
-    evict_projects(targets, sized, total, max_size, short_of_free, removed)
+    evict_projects(
+        gctx,
+        targets,
+        sized,
+        total,
+        max_size,
+        short_of_free,
+        removed,
+    )
 }
 
 /// Removes whole projects, `sized` least recently built first, see
 /// [`collect_idle_projects`].
 fn evict_projects(
+    gctx: &GlobalContext,
     targets: &Path,
     sized: Vec<(PathBuf, Duration, u64)>,
     mut total: u64,
@@ -843,7 +856,10 @@ fn evict_projects(
     let mut freed = 0;
     let mut left = Vec::with_capacity(sized.len());
     for (dir, idle, size) in sized {
-        if total > max_size && idle > RECENT_PROJECT && remove_project(targets, &dir, removed)? {
+        if total > max_size
+            && idle > RECENT_PROJECT
+            && remove_project(gctx, targets, &dir, removed)?
+        {
             total = total.saturating_sub(size);
             freed += size;
         } else {
@@ -856,7 +872,7 @@ fn evict_projects(
         if freed >= short_of_free {
             break;
         }
-        if remove_project(targets, &dir, removed)? {
+        if remove_project(gctx, targets, &dir, removed)? {
             freed += size;
         }
     }
@@ -971,14 +987,29 @@ fn last_project_use(dir: &Path) -> CargoResult<FileTime> {
     Ok(last)
 }
 
-/// Removes a whole project build-dir unless a build holds one of its
-/// `<profile>/.cargo-build-lock`. It is first renamed away so that a build
-/// starting meanwhile gets a fresh, empty directory.
-fn remove_project(targets: &Path, dir: &Path, removed: &mut Removed) -> CargoResult<bool> {
+/// Project EX protects profiles that do not exist in a directory snapshot yet.
+/// Builders opened before rename recheck their lock inode before creating a
+/// profile; new builders get a fresh, empty directory. Returns whether the
+/// project was removed.
+fn remove_project(
+    gctx: &GlobalContext,
+    targets: &Path,
+    dir: &Path,
+    removed: &mut Removed,
+) -> CargoResult<bool> {
+    let hook = super::locking::TestHook::for_path(gctx, dir, "gc");
+    hook.event("ProjectGcCandidate")?;
+    let Some(_project_lock) = super::locking::try_lock_project(dir)? else {
+        return Ok(false);
+    };
+    hook.event("ProjectGcAcquired")?;
+    // Keep the old profile checks as well, but never wait while holding EX.
     let mut _locks = Vec::new();
     for profile in profile_dirs(dir)? {
-        let Ok(file) = fs::File::open(profile.join(".cargo-build-lock")) else {
-            continue;
+        let file = match fs::File::open(profile.join(".cargo-build-lock")) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
         };
         match flock::try_lock_exclusive(&file) {
             Ok(()) => _locks.push(file),
@@ -993,16 +1024,12 @@ fn remove_project(targets: &Path, dir: &Path, removed: &mut Removed) -> CargoRes
     let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let trash = targets.join(format!(".{name}{REMOVING_SUFFIX}{}", std::process::id()));
     debug!("build.gc removing idle project {}", dir.display());
-    // Windows cannot rename a directory with open files, the lock files here.
-    let renamed = fs::rename(dir, &trash).or_else(|_| {
-        _locks.clear();
-        fs::rename(dir, &trash)
-    });
-    if let Err(e) = renamed {
+    // Never drop protection to retry a rename (including on Windows).
+    // Skipping collection is preferable to deleting an active build root.
+    if let Err(e) = fs::rename(dir, &trash) {
         debug!("build.gc skipping {}: {e}", dir.display());
         return Ok(false);
     }
-    drop(_locks);
     paths::remove_dir_all(&trash)?;
     removed.projects += 1;
     removed.bytes += size;
@@ -1165,7 +1192,7 @@ fn remove_dangling_out_link(gctx: &GlobalContext, link: &Path) -> CargoResult<()
     if link.extension().is_some() || !is_dangling_out_link(link)? {
         return Ok(());
     }
-    super::locking::TestHook::out_link_gc(gctx, link).event("OutLinkCandidate")?;
+    super::locking::TestHook::for_path(gctx, link, "gc").event("OutLinkCandidate")?;
     // The target may be visible only in the builder's mount namespace. Use
     // the builder's lock even if no lock file exists yet, without recreating
     // a removed parent directory. Never unlink this file: waiters may already
@@ -1442,7 +1469,14 @@ mod tests {
             projects_max_size: MaxSize::None,
             ..GcSettings::default()
         };
-        collect_idle_projects(&tmp, &[current.as_path()], &settings, &mut removed).unwrap();
+        collect_idle_projects(
+            &GlobalContext::default().unwrap(),
+            &tmp,
+            &[current.as_path()],
+            &settings,
+            &mut removed,
+        )
+        .unwrap();
         drop(lock);
         let left = |d: &Path| d.exists();
         let result = (
@@ -1486,7 +1520,14 @@ mod tests {
             projects_max_size: MaxSize::None,
             ..GcSettings::default()
         };
-        collect_idle_projects(&tmp, &[], &settings, &mut removed).unwrap();
+        collect_idle_projects(
+            &GlobalContext::default().unwrap(),
+            &tmp,
+            &[],
+            &settings,
+            &mut removed,
+        )
+        .unwrap();
         let result = (
             active.join("debug/incremental/foo-1abc").exists(),
             idle.join("debug/incremental/foo-1abc").exists(),
@@ -1518,7 +1559,14 @@ mod tests {
             projects_max_size: MaxSize::Bytes(5 * size as u64),
             ..GcSettings::default()
         };
-        collect_idle_projects(&tmp, &[current.as_path()], &settings, &mut removed).unwrap();
+        collect_idle_projects(
+            &GlobalContext::default().unwrap(),
+            &tmp,
+            &[current.as_path()],
+            &settings,
+            &mut removed,
+        )
+        .unwrap();
         let result = (
             newest.exists(),
             middle.exists(),
@@ -1551,11 +1599,29 @@ mod tests {
 
         // Over the limit: only the project not built recently goes.
         let mut removed = Removed::default();
-        evict_projects(&tmp, projects.to_vec(), 300, 50, 0, &mut removed).unwrap();
+        evict_projects(
+            &GlobalContext::default().unwrap(),
+            &tmp,
+            projects.to_vec(),
+            300,
+            50,
+            0,
+            &mut removed,
+        )
+        .unwrap();
         let over_limit = (left(&projects), removed.projects);
 
         // Short of free space: recent ones go too, oldest first, until enough.
-        evict_projects(&tmp, projects.to_vec(), 200, u64::MAX, 150, &mut removed).unwrap();
+        evict_projects(
+            &GlobalContext::default().unwrap(),
+            &tmp,
+            projects.to_vec(),
+            200,
+            u64::MAX,
+            150,
+            &mut removed,
+        )
+        .unwrap();
         let disk_full = (left(&projects), removed.projects);
         let _ = fs::remove_dir_all(&tmp);
         assert_eq!(over_limit, (vec![false, true, true], 1));

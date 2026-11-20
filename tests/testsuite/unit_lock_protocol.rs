@@ -734,6 +734,116 @@ fn out_link_collector(p: &Project, cwd: &Path, home: &Path) -> Command {
     command
 }
 
+// Age fixture data, not an elapsed-time deadline: every candidate is older than
+// the default idle-project retention period before either process starts.
+fn idle_project_fixture(controller: &mut Controller) -> (Project, Project, PathBuf, PathBuf) {
+    let victim = project()
+        .at("victim")
+        .file(
+            "Cargo.toml",
+            "[package]\nname='victim'\nversion='0.1.0'\nedition='2024'\n",
+        )
+        .file("src/lib.rs", "pub fn value() -> u32 { 1 }")
+        .build();
+    let collector = project()
+        .at("collector")
+        .file(
+            "Cargo.toml",
+            "[package]\nname='collector'\nversion='0.1.0'\nedition='2024'\n",
+        )
+        .file("src/lib.rs", "pub fn value() -> u32 { 2 }")
+        .build();
+    let home = controller.dir.path().join("project-gc-home");
+    let mut seed = fork_command(&victim, &victim.root(), &home, "build --lib", "seed");
+    seed.env("CARGO_BUILD_GC_FREQUENCY", "never");
+    success(controller.spawn(seed).wait(controller));
+    let roots: Vec<_> = fs::read_dir(home.join("targets"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_dir())
+        .collect();
+    assert_eq!(roots.len(), 1, "{roots:?}");
+    let root = roots.into_iter().next().unwrap();
+    let old = filetime::FileTime::from_unix_time(1, 0);
+    for entry in walkdir::WalkDir::new(&root).contents_first(true) {
+        filetime::set_symlink_file_times(entry.unwrap().path(), old, old).unwrap();
+    }
+    (victim, collector, home, root)
+}
+
+#[cargo_test]
+fn idle_project_gc_preserves_a_new_profile_started_after_candidate_observation() {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut controller = Controller::new();
+    let (victim, collector, home, root) = idle_project_fixture(&mut controller);
+    let mut collect = fork_command(&collector, &collector.root(), &home, "build --lib", "GC");
+    collect
+        .env("CARGO_BUILD_GC_FREQUENCY", "always")
+        .env("CARGO_SHARED_DEPS", "1");
+    let collect = controller.spawn(collect);
+    let candidate = controller.until(collect.pid, "ProjectGcCandidate", "", "gc");
+    assert_eq!(candidate.lock(), root);
+    // The collector has observed only debug/.cargo-build-lock. A new release
+    // profile must be protected without depending on that directory snapshot.
+    let mut build = fork_command(&victim, &victim.root(), &home, "build --lib --release", "B");
+    build.env("CARGO_BUILD_GC_FREQUENCY", "never");
+    let build = controller.spawn(build);
+    let linked = controller.until(build.pid, "OutDirLinked", "victim", "compile");
+    let link = linked.lock();
+    let lock = link.with_extension("lock");
+    let inode = fs::metadata(&lock).unwrap().ino();
+    candidate.resume(0);
+    success(collect.wait(&mut controller));
+    let preserved = link.is_symlink() && lock.is_file();
+    linked.resume(0);
+    // Run actual rustc before checking preservation, retaining its real failure
+    // when a collector removes the active profile's output paths.
+    success(build.wait(&mut controller));
+    assert!(preserved, "GC removed an active new profile: {link:?}");
+    assert_eq!(fs::metadata(lock).unwrap().ino(), inode);
+}
+
+#[cargo_test]
+fn idle_project_gc_waiter_reopens_a_lock_from_a_removed_project() {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut controller = Controller::new();
+    let (victim, collector, home, root) = idle_project_fixture(&mut controller);
+    let mut collect = fork_command(&collector, &collector.root(), &home, "build --lib", "GC");
+    collect
+        .env("CARGO_BUILD_GC_FREQUENCY", "always")
+        .env("CARGO_SHARED_DEPS", "1");
+    let collect = controller.spawn(collect);
+    let removing = controller.until(collect.pid, "ProjectGcAcquired", "", "gc");
+    assert_eq!(removing.lock(), root);
+    let mut build = fork_command(&victim, &victim.root(), &home, "build --lib --release", "B");
+    build.env("CARGO_BUILD_GC_FREQUENCY", "never");
+    let build = controller.spawn(build);
+    let opened = controller.until(build.pid, "ProjectGcOpened", "", "layout");
+    let lock = opened.lock();
+    assert_eq!(lock.parent().unwrap(), root);
+    assert!(
+        !root.join("release").exists(),
+        "profile creation must follow project SH"
+    );
+    // Retain the descriptor so its inode cannot be recycled for the new root.
+    // The builder also opened this inode but has not yet tried its shared lock.
+    let old_file = File::open(&lock).unwrap();
+    let old_inode = old_file.metadata().unwrap().ino();
+    opened.resume(0);
+    removing.resume(0);
+    // No timing guess about whether the builder already blocked on SH: either
+    // way, it must reject the old descriptor and open the current path again.
+    let reopened = controller.until(build.pid, "ProjectGcOpened", "", "layout");
+    assert_eq!(reopened.lock(), lock);
+    assert_ne!(fs::metadata(&lock).unwrap().ino(), old_inode);
+    assert!(root.join("CACHEDIR.TAG").is_file());
+    assert!(!root.join("release").exists());
+    success(collect.wait(&mut controller));
+    reopened.resume(0);
+    success(build.wait(&mut controller));
+    assert!(root.join("release/.out").is_dir());
+}
+
 #[cargo_test]
 fn out_link_gc_preserves_an_active_compile_with_an_unresolvable_target() {
     use std::os::unix::fs::MetadataExt as _;
