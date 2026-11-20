@@ -308,7 +308,12 @@ fn run_inner(build_runner: &BuildRunner<'_, '_>, build_start: SystemTime) -> Car
             let target_dir = ws.target_dir().into_path_unlocked();
             collect_orphan_outputs(&target_dir, settings.max_unused, &mut removed)?;
             if !root.starts_with(&target_dir) {
-                collect_foreign_outputs(&target_dir, FOREIGN_OUTPUTS_MAX_UNUSED, &mut removed)?;
+                collect_foreign_outputs(
+                    gctx,
+                    &target_dir,
+                    FOREIGN_OUTPUTS_MAX_UNUSED,
+                    &mut removed,
+                )?;
             }
         }
         touch(&marker, now)?;
@@ -316,6 +321,7 @@ fn run_inner(build_runner: &BuildRunner<'_, '_>, build_start: SystemTime) -> Car
             && let Some(targets) = dir.parent()
         {
             collect_idle_projects(
+                gctx,
                 targets,
                 &[root.as_path(), dir.as_path()],
                 &settings,
@@ -736,8 +742,12 @@ fn collect_orphan_outputs(
 /// `[<target>/]<profile>/`: `deps/`, `incremental/`, `build/` and
 /// `.fingerprint/`. This Cargo keeps its build units in the build-dir and
 /// only links outputs into the target-dir, so it never uses them. Only
-/// directories nothing has written to for `max_unused` go.
+/// directories nothing has written to for `max_unused` go, and only from a
+/// profile whose `.cargo-build-lock` (which a stock Cargo holds for its whole
+/// build) is free: a profile without that file is skipped, as nothing shows
+/// that no build is running there.
 fn collect_foreign_outputs(
+    gctx: &GlobalContext,
     target_dir: &Path,
     max_unused: Duration,
     removed: &mut Removed,
@@ -754,10 +764,29 @@ fn collect_foreign_outputs(
             );
         }
     }
+    let is_stale =
+        |dir: &Path| dir.is_dir() && age(newest_mtime_within(dir, max_unused)) > max_unused;
+    let names = ["deps", "incremental", "build", ".fingerprint"];
+    let mut error = None;
     for profile in profiles {
-        for name in ["deps", "incremental", "build", ".fingerprint"] {
-            let dir = profile.join(name);
-            if !dir.is_dir() || age(newest_mtime_within(&dir, max_unused)) <= max_unused {
+        if !names.iter().any(|name| is_stale(&profile.join(name))) {
+            continue;
+        }
+        super::locking::TestHook::for_path(gctx, &profile, "gc")
+            .event("ForeignOutputsCandidate")?;
+        // Held until this profile is done. Never wait, and never remove on
+        // an error: a bad profile must not stop the others.
+        let _lock = match lock_foreign_profile(&profile) {
+            Ok(Some(lock)) => lock,
+            Ok(None) => continue,
+            Err(e) => {
+                error.get_or_insert(e);
+                continue;
+            }
+        };
+        for dir in names.iter().map(|name| profile.join(name)) {
+            // A build may have written since the observation above.
+            if !is_stale(&dir) {
                 continue;
             }
             let size = cargo_util::du(&dir, &[]).unwrap_or(0);
@@ -767,7 +796,25 @@ fn collect_foreign_outputs(
             removed.bytes += size;
         }
     }
-    Ok(())
+    error.map_or(Ok(()), Err)
+}
+
+/// The exclusive `<profile>/.cargo-build-lock` of a stock Cargo's profile, or
+/// `None` when a build holds it or it does not exist.
+fn lock_foreign_profile(profile: &Path) -> CargoResult<Option<fs::File>> {
+    let file = match fs::File::open(profile.join(".cargo-build-lock")) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    match flock::try_lock_exclusive(&file) {
+        Ok(()) => Ok(Some(file)),
+        Err(fs::TryLockError::WouldBlock) => {
+            debug!("build.gc skipping {}: in use", profile.display());
+            Ok(None)
+        }
+        Err(fs::TryLockError::Error(e)) => Err(e.into()),
+    }
 }
 
 /// Collects the build-dirs in `targets` (`{cargo-cache-home}/targets/`)
@@ -775,6 +822,7 @@ fn collect_foreign_outputs(
 /// (with a `CACHEDIR.TAG`) are considered, and a project a running build has
 /// locked is never removed whole.
 fn collect_idle_projects(
+    gctx: &GlobalContext,
     targets: &Path,
     keep: &[&Path],
     settings: &GcSettings,
@@ -785,7 +833,9 @@ fn collect_idle_projects(
         let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
         // Left over from a removal that was interrupted.
         if name.starts_with('.') && name.contains(REMOVING_SUFFIX) {
-            let _ = paths::remove_dir_all(&dir);
+            if let Some(_lock) = super::locking::try_lock_project(&dir)? {
+                let _ = paths::remove_dir_all(&dir);
+            }
             continue;
         }
         if name.starts_with('.')
@@ -796,11 +846,11 @@ fn collect_idle_projects(
         }
         let idle = age(last_project_use(&dir)?);
         if idle > settings.shared_max_unused {
-            remove_project(targets, &dir, removed)?;
+            remove_project(gctx, targets, &dir, removed)?;
             continue;
         }
         if idle > settings.max_unused {
-            strip_idle_project(&dir, settings.max_unused, removed)?;
+            strip_idle_project(gctx, &dir, settings.max_unused, removed)?;
         }
         projects.push((dir, idle));
     }
@@ -825,12 +875,21 @@ fn collect_idle_projects(
         "project build-dirs are {total} bytes (limit {max_size}), \
          disk short of {short_of_free} free bytes"
     );
-    evict_projects(targets, sized, total, max_size, short_of_free, removed)
+    evict_projects(
+        gctx,
+        targets,
+        sized,
+        total,
+        max_size,
+        short_of_free,
+        removed,
+    )
 }
 
 /// Removes whole projects, `sized` least recently built first, see
 /// [`collect_idle_projects`].
 fn evict_projects(
+    gctx: &GlobalContext,
     targets: &Path,
     sized: Vec<(PathBuf, Duration, u64)>,
     mut total: u64,
@@ -843,7 +902,10 @@ fn evict_projects(
     let mut freed = 0;
     let mut left = Vec::with_capacity(sized.len());
     for (dir, idle, size) in sized {
-        if total > max_size && idle > RECENT_PROJECT && remove_project(targets, &dir, removed)? {
+        if total > max_size
+            && idle > RECENT_PROJECT
+            && remove_project(gctx, targets, &dir, removed)?
+        {
             total = total.saturating_sub(size);
             freed += size;
         } else {
@@ -856,7 +918,7 @@ fn evict_projects(
         if freed >= short_of_free {
             break;
         }
-        if remove_project(targets, &dir, removed)? {
+        if remove_project(gctx, targets, &dir, removed)? {
             freed += size;
         }
     }
@@ -935,7 +997,18 @@ fn disk_space(_path: &Path) -> Option<(u64, u64)> {
 /// Removes what only the next edit of an idle project would use: its
 /// incremental dirs, and `tmp/` entries unused for `max_unused`. Its build
 /// units stay, so building it again as it was rebuilds nothing.
-fn strip_idle_project(dir: &Path, max_unused: Duration, removed: &mut Removed) -> CargoResult<()> {
+fn strip_idle_project(
+    gctx: &GlobalContext,
+    dir: &Path,
+    max_unused: Duration,
+    removed: &mut Removed,
+) -> CargoResult<()> {
+    super::locking::TestHook::for_path(gctx, dir, "gc").event("ProjectGcStripCandidate")?;
+    // A build's last use is only written when it ends, so an idle-looking
+    // project may be building now: its builders hold the project lock.
+    let Some(_project_lock) = super::locking::try_lock_project(dir)? else {
+        return Ok(());
+    };
     let before = removed.bytes;
     for profile in profile_dirs(dir)? {
         for incremental in read_dirs(&profile.join("incremental"))? {
@@ -971,14 +1044,29 @@ fn last_project_use(dir: &Path) -> CargoResult<FileTime> {
     Ok(last)
 }
 
-/// Removes a whole project build-dir unless a build holds one of its
-/// `<profile>/.cargo-build-lock`. It is first renamed away so that a build
-/// starting meanwhile gets a fresh, empty directory.
-fn remove_project(targets: &Path, dir: &Path, removed: &mut Removed) -> CargoResult<bool> {
+/// Project EX protects profiles that do not exist in a directory snapshot yet.
+/// Builders opened before rename recheck their lock inode before creating a
+/// profile; new builders get a fresh, empty directory. Returns whether the
+/// project was removed.
+fn remove_project(
+    gctx: &GlobalContext,
+    targets: &Path,
+    dir: &Path,
+    removed: &mut Removed,
+) -> CargoResult<bool> {
+    let hook = super::locking::TestHook::for_path(gctx, dir, "gc");
+    hook.event("ProjectGcCandidate")?;
+    let Some(_project_lock) = super::locking::try_lock_project(dir)? else {
+        return Ok(false);
+    };
+    hook.event("ProjectGcAcquired")?;
+    // Keep the old profile checks as well, but never wait while holding EX.
     let mut _locks = Vec::new();
     for profile in profile_dirs(dir)? {
-        let Ok(file) = fs::File::open(profile.join(".cargo-build-lock")) else {
-            continue;
+        let file = match fs::File::open(profile.join(".cargo-build-lock")) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
         };
         match flock::try_lock_exclusive(&file) {
             Ok(()) => _locks.push(file),
@@ -993,16 +1081,12 @@ fn remove_project(targets: &Path, dir: &Path, removed: &mut Removed) -> CargoRes
     let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let trash = targets.join(format!(".{name}{REMOVING_SUFFIX}{}", std::process::id()));
     debug!("build.gc removing idle project {}", dir.display());
-    // Windows cannot rename a directory with open files, the lock files here.
-    let renamed = fs::rename(dir, &trash).or_else(|_| {
-        _locks.clear();
-        fs::rename(dir, &trash)
-    });
-    if let Err(e) = renamed {
+    // Never drop protection to retry a rename (including on Windows).
+    // Skipping collection is preferable to deleting an active build root.
+    if let Err(e) = fs::rename(dir, &trash) {
         debug!("build.gc skipping {}: {e}", dir.display());
         return Ok(false);
     }
-    drop(_locks);
     paths::remove_dir_all(&trash)?;
     removed.projects += 1;
     removed.bytes += size;
@@ -1165,7 +1249,7 @@ fn remove_dangling_out_link(gctx: &GlobalContext, link: &Path) -> CargoResult<()
     if link.extension().is_some() || !is_dangling_out_link(link)? {
         return Ok(());
     }
-    super::locking::TestHook::out_link_gc(gctx, link).event("OutLinkCandidate")?;
+    super::locking::TestHook::for_path(gctx, link, "gc").event("OutLinkCandidate")?;
     // The target may be visible only in the builder's mount namespace. Use
     // the builder's lock even if no lock file exists yet, without recreating
     // a removed parent directory. Never unlink this file: waiters may already
@@ -1442,7 +1526,14 @@ mod tests {
             projects_max_size: MaxSize::None,
             ..GcSettings::default()
         };
-        collect_idle_projects(&tmp, &[current.as_path()], &settings, &mut removed).unwrap();
+        collect_idle_projects(
+            &GlobalContext::default().unwrap(),
+            &tmp,
+            &[current.as_path()],
+            &settings,
+            &mut removed,
+        )
+        .unwrap();
         drop(lock);
         let left = |d: &Path| d.exists();
         let result = (
@@ -1486,7 +1577,14 @@ mod tests {
             projects_max_size: MaxSize::None,
             ..GcSettings::default()
         };
-        collect_idle_projects(&tmp, &[], &settings, &mut removed).unwrap();
+        collect_idle_projects(
+            &GlobalContext::default().unwrap(),
+            &tmp,
+            &[],
+            &settings,
+            &mut removed,
+        )
+        .unwrap();
         let result = (
             active.join("debug/incremental/foo-1abc").exists(),
             idle.join("debug/incremental/foo-1abc").exists(),
@@ -1518,7 +1616,14 @@ mod tests {
             projects_max_size: MaxSize::Bytes(5 * size as u64),
             ..GcSettings::default()
         };
-        collect_idle_projects(&tmp, &[current.as_path()], &settings, &mut removed).unwrap();
+        collect_idle_projects(
+            &GlobalContext::default().unwrap(),
+            &tmp,
+            &[current.as_path()],
+            &settings,
+            &mut removed,
+        )
+        .unwrap();
         let result = (
             newest.exists(),
             middle.exists(),
@@ -1551,11 +1656,29 @@ mod tests {
 
         // Over the limit: only the project not built recently goes.
         let mut removed = Removed::default();
-        evict_projects(&tmp, projects.to_vec(), 300, 50, 0, &mut removed).unwrap();
+        evict_projects(
+            &GlobalContext::default().unwrap(),
+            &tmp,
+            projects.to_vec(),
+            300,
+            50,
+            0,
+            &mut removed,
+        )
+        .unwrap();
         let over_limit = (left(&projects), removed.projects);
 
         // Short of free space: recent ones go too, oldest first, until enough.
-        evict_projects(&tmp, projects.to_vec(), 200, u64::MAX, 150, &mut removed).unwrap();
+        evict_projects(
+            &GlobalContext::default().unwrap(),
+            &tmp,
+            projects.to_vec(),
+            200,
+            u64::MAX,
+            150,
+            &mut removed,
+        )
+        .unwrap();
         let disk_full = (left(&projects), removed.projects);
         let _ = fs::remove_dir_all(&tmp);
         assert_eq!(over_limit, (vec![false, true, true], 1));
@@ -1594,11 +1717,25 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
         let profile = tmp.join("debug");
         let cross = tmp.join("wasm32-unknown-unknown/debug");
-        for p in [&profile, &cross] {
+        // No `.cargo-build-lock` to prove that no build runs: left alone.
+        let unlocked = tmp.join("release");
+        // A build holds the lock: left alone.
+        let busy = tmp.join("bench");
+        for p in [&profile, &cross, &unlocked, &busy] {
             fs::create_dir_all(p.join("deps")).unwrap();
             fs::write(p.join(".cargo-lock"), "").unwrap();
             fs::write(p.join("deps/libfoo.rlib"), "x").unwrap();
             fs::write(p.join("foo"), "bin").unwrap();
+        }
+        for p in [&profile, &cross, &busy] {
+            fs::write(p.join(".cargo-build-lock"), "").unwrap();
+        }
+        let held = fs::File::open(busy.join(".cargo-build-lock")).unwrap();
+        flock::lock_shared(&held).unwrap();
+        for p in [&unlocked, &busy] {
+            for f in ["deps/libfoo.rlib", "deps"] {
+                filetime::set_file_mtime(p.join(f), days_ago(1)).unwrap();
+            }
         }
         fs::create_dir_all(profile.join("incremental/foo-1/s-1")).unwrap();
         for f in [
@@ -1612,16 +1749,25 @@ mod tests {
         }
         // Written a moment ago: a build may be running.
         let mut removed = Removed::default();
-        collect_foreign_outputs(&tmp, Duration::from_secs(3600), &mut removed).unwrap();
+        collect_foreign_outputs(
+            &GlobalContext::default().unwrap(),
+            &tmp,
+            Duration::from_secs(3600),
+            &mut removed,
+        )
+        .unwrap();
         let result = (
             profile.join("deps").exists(),
             profile.join("incremental").exists(),
             profile.join("foo").exists(),
             cross.join("deps").exists(),
+            unlocked.join("deps").exists(),
+            busy.join("deps").exists(),
             removed.count,
         );
+        drop(held);
         let _ = fs::remove_dir_all(&tmp);
-        assert_eq!(result, (false, false, true, true, 2));
+        assert_eq!(result, (false, false, true, true, true, true, 2));
     }
 
     fn days_ago(days: i64) -> FileTime {

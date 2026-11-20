@@ -256,7 +256,8 @@ directories (2.3 GB and 0.4 GB) plus the shared dependencies (2.2 GB).
   day go too, and so do binaries in `./target` whose build unit was removed
   (they would otherwise keep its whole size), and so do `deps/`,
   `incremental/`, `build/` and `.fingerprint/` in `./target`, which only the
-  stock Cargo writes, once nothing has written to them for an hour. Nothing a
+  stock Cargo writes, once nothing has written to them for an hour and no
+  build holds the profile's `.cargo-build-lock`. Nothing a
   running build has locked is removed.
 - **No duplicate object files on macOS.** Debuggers and backtraces read the
   objects inside each rlib, so the loose copies rustc leaves beside it are

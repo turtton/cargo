@@ -1,4 +1,6 @@
-//! Lock order: package GC SH -> writer gate EX -> unit EX/SH -> output-link lock.
+//! Lock order: project SH -> package GC SH -> writer gate EX -> unit EX/SH ->
+//! output-link lock. Whole-project GC only tries project EX and never waits
+//! for other locks while holding it.
 //! A gate holder never waits for unit EX. Reader conflicts are bounded; a
 //! live writer is not subject to that deadline. All OS waits are outside the
 //! manager's map mutexes, and every writer owns its file description.
@@ -22,7 +24,9 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+mod project_gc;
 mod test_hook;
+pub(super) use project_gc::{lock_project, try_lock_project};
 pub(in crate::compiler) use test_hook::TestHook;
 
 pub(super) const GC_LOCK_FILE: &str = ".cargo-gc-lock";

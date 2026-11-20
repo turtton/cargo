@@ -204,6 +204,7 @@
 //! `target/$TUPLE`.
 
 use crate::compiler::CompileTarget;
+use crate::compiler::locking::lock_project;
 use crate::util::flock::is_on_nfs_mount;
 use crate::util::{CargoResult, FileLock, Filesystem};
 use crate::workspace::Workspace;
@@ -220,6 +221,9 @@ pub struct Layout {
     /// using the default build-dir. See [`Workspace::shared_deps_dir`].
     shared_build_dir: Option<BuildDirLayout>,
     _lock: Option<FileLock>,
+    // Project guards outlive profile locks, covering both the workspace and
+    // shared-deps root before any target/profile directory is created.
+    _project_locks: Vec<same_file::Handle>,
 }
 
 impl Layout {
@@ -239,6 +243,15 @@ impl Layout {
         let is_new_layout = ws.gctx().cli_unstable().build_dir_new_layout;
         let mut root = ws.target_dir();
         let mut build_root = ws.build_dir();
+        // Preserve outer-first backup exclusion even when the artifact and
+        // build roots nest. No target/profile may precede project protection.
+        for dir in outer_first(root.as_path_unlocked(), build_root.as_path_unlocked()) {
+            paths::create_dir_all_excluded_from_backups_atomic(dir)?;
+        }
+        let mut project_locks = Vec::new();
+        if let Some(lock) = lock_project(build_root.as_path_unlocked(), ws.gctx())? {
+            project_locks.push(lock);
+        }
         if let Some(target) = target {
             root.push(target.short_name());
             build_root.push(target.short_name());
@@ -325,6 +338,9 @@ impl Layout {
                     && ws.gctx().cli_unstable().fine_grain_locking
                     && !must_take_build_dir_lock_exclusively =>
             {
+                if let Some(lock) = lock_project(&shared_root, ws.gctx())? {
+                    project_locks.push(lock);
+                }
                 if let Some(target) = target {
                     shared_root.push(target.short_name());
                 }
@@ -365,6 +381,7 @@ impl Layout {
                 is_new_layout,
             },
             _lock: lock,
+            _project_locks: project_locks,
         })
     }
 
