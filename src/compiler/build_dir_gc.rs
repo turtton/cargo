@@ -742,7 +742,10 @@ fn collect_orphan_outputs(
 /// `[<target>/]<profile>/`: `deps/`, `incremental/`, `build/` and
 /// `.fingerprint/`. This Cargo keeps its build units in the build-dir and
 /// only links outputs into the target-dir, so it never uses them. Only
-/// directories nothing has written to for `max_unused` go.
+/// directories nothing has written to for `max_unused` go, and only from a
+/// profile whose `.cargo-build-lock` (which a stock Cargo holds for its whole
+/// build) is free: a profile without that file is skipped, as nothing shows
+/// that no build is running there.
 fn collect_foreign_outputs(
     gctx: &GlobalContext,
     target_dir: &Path,
@@ -761,20 +764,31 @@ fn collect_foreign_outputs(
             );
         }
     }
+    let is_stale =
+        |dir: &Path| dir.is_dir() && age(newest_mtime_within(dir, max_unused)) > max_unused;
+    let names = ["deps", "incremental", "build", ".fingerprint"];
+    let mut error = None;
     for profile in profiles {
-        let is_stale =
-            |dir: &Path| dir.is_dir() && age(newest_mtime_within(dir, max_unused)) > max_unused;
-        let stale: Vec<_> = ["deps", "incremental", "build", ".fingerprint"]
-            .into_iter()
-            .map(|name| profile.join(name))
-            .filter(|dir| is_stale(dir))
-            .collect();
-        if stale.is_empty() {
+        if !names.iter().any(|name| is_stale(&profile.join(name))) {
             continue;
         }
         super::locking::TestHook::for_path(gctx, &profile, "gc")
             .event("ForeignOutputsCandidate")?;
-        for dir in stale {
+        // Held until this profile is done. Never wait, and never remove on
+        // an error: a bad profile must not stop the others.
+        let _lock = match lock_foreign_profile(&profile) {
+            Ok(Some(lock)) => lock,
+            Ok(None) => continue,
+            Err(e) => {
+                error.get_or_insert(e);
+                continue;
+            }
+        };
+        for dir in names.iter().map(|name| profile.join(name)) {
+            // A build may have written since the observation above.
+            if !is_stale(&dir) {
+                continue;
+            }
             let size = cargo_util::du(&dir, &[]).unwrap_or(0);
             debug!("build.gc removing foreign outputs {}", dir.display());
             paths::remove_dir_all(&dir)?;
@@ -782,7 +796,25 @@ fn collect_foreign_outputs(
             removed.bytes += size;
         }
     }
-    Ok(())
+    error.map_or(Ok(()), Err)
+}
+
+/// The exclusive `<profile>/.cargo-build-lock` of a stock Cargo's profile, or
+/// `None` when a build holds it or it does not exist.
+fn lock_foreign_profile(profile: &Path) -> CargoResult<Option<fs::File>> {
+    let file = match fs::File::open(profile.join(".cargo-build-lock")) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    match flock::try_lock_exclusive(&file) {
+        Ok(()) => Ok(Some(file)),
+        Err(fs::TryLockError::WouldBlock) => {
+            debug!("build.gc skipping {}: in use", profile.display());
+            Ok(None)
+        }
+        Err(fs::TryLockError::Error(e)) => Err(e.into()),
+    }
 }
 
 /// Collects the build-dirs in `targets` (`{cargo-cache-home}/targets/`)
@@ -972,6 +1004,11 @@ fn strip_idle_project(
     removed: &mut Removed,
 ) -> CargoResult<()> {
     super::locking::TestHook::for_path(gctx, dir, "gc").event("ProjectGcStripCandidate")?;
+    // A build's last use is only written when it ends, so an idle-looking
+    // project may be building now: its builders hold the project lock.
+    let Some(_project_lock) = super::locking::try_lock_project(dir)? else {
+        return Ok(());
+    };
     let before = removed.bytes;
     for profile in profile_dirs(dir)? {
         for incremental in read_dirs(&profile.join("incremental"))? {
@@ -1680,11 +1717,25 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
         let profile = tmp.join("debug");
         let cross = tmp.join("wasm32-unknown-unknown/debug");
-        for p in [&profile, &cross] {
+        // No `.cargo-build-lock` to prove that no build runs: left alone.
+        let unlocked = tmp.join("release");
+        // A build holds the lock: left alone.
+        let busy = tmp.join("bench");
+        for p in [&profile, &cross, &unlocked, &busy] {
             fs::create_dir_all(p.join("deps")).unwrap();
             fs::write(p.join(".cargo-lock"), "").unwrap();
             fs::write(p.join("deps/libfoo.rlib"), "x").unwrap();
             fs::write(p.join("foo"), "bin").unwrap();
+        }
+        for p in [&profile, &cross, &busy] {
+            fs::write(p.join(".cargo-build-lock"), "").unwrap();
+        }
+        let held = fs::File::open(busy.join(".cargo-build-lock")).unwrap();
+        flock::lock_shared(&held).unwrap();
+        for p in [&unlocked, &busy] {
+            for f in ["deps/libfoo.rlib", "deps"] {
+                filetime::set_file_mtime(p.join(f), days_ago(1)).unwrap();
+            }
         }
         fs::create_dir_all(profile.join("incremental/foo-1/s-1")).unwrap();
         for f in [
@@ -1710,10 +1761,13 @@ mod tests {
             profile.join("incremental").exists(),
             profile.join("foo").exists(),
             cross.join("deps").exists(),
+            unlocked.join("deps").exists(),
+            busy.join("deps").exists(),
             removed.count,
         );
+        drop(held);
         let _ = fs::remove_dir_all(&tmp);
-        assert_eq!(result, (false, false, true, true, 2));
+        assert_eq!(result, (false, false, true, true, true, true, 2));
     }
 
     fn days_ago(days: i64) -> FileTime {
