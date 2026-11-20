@@ -1546,7 +1546,14 @@ mod tests {
             removed.projects,
         );
         let _ = fs::remove_dir_all(&tmp);
-        assert_eq!(result, (false, true, true, true, true, false, 1));
+        // Windows cannot rename a project directory whose lock file a collector
+        // holds open, so it never removes a whole project: it skips it.
+        let expected = if cfg!(windows) {
+            (true, true, true, true, true, false, 0)
+        } else {
+            (false, true, true, true, true, false, 1)
+        };
+        assert_eq!(result, expected);
     }
 
     /// A project build-dir last built `days` ago, with a unit and an
@@ -1632,7 +1639,13 @@ mod tests {
             removed.projects,
         );
         let _ = fs::remove_dir_all(&tmp);
-        assert_eq!(result, (true, true, false, true, 1));
+        // Windows skips whole-project removal, see `idle_projects`.
+        let expected = if cfg!(windows) {
+            (true, true, true, true, 0)
+        } else {
+            (true, true, false, true, 1)
+        };
+        assert_eq!(result, expected);
     }
 
     fn hours_ago(hours: i64) -> FileTime {
@@ -1681,8 +1694,14 @@ mod tests {
         .unwrap();
         let disk_full = (left(&projects), removed.projects);
         let _ = fs::remove_dir_all(&tmp);
-        assert_eq!(over_limit, (vec![false, true, true], 1));
-        assert_eq!(disk_full, (vec![false, false, false], 3));
+        // Windows skips whole-project removal, see `idle_projects`.
+        if cfg!(windows) {
+            assert_eq!(over_limit, (vec![true, true, true], 0));
+            assert_eq!(disk_full, (vec![true, true, true], 0));
+        } else {
+            assert_eq!(over_limit, (vec![false, true, true], 1));
+            assert_eq!(disk_full, (vec![false, false, false], 3));
+        }
     }
 
     #[test]
