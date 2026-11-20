@@ -305,9 +305,7 @@ fn make_failed_scrape_diagnostic(
     top_line: impl Display,
 ) -> String {
     let manifest_path = unit.pkg.manifest_path();
-    let relative_manifest_path = manifest_path
-        .strip_prefix(build_runner.bcx.ws.root())
-        .unwrap_or(&manifest_path);
+    let relative_manifest_path = manifest_path.trim_prefix(build_runner.bcx.ws.root());
 
     format!(
         "\
@@ -635,25 +633,6 @@ fn rustc(
 
         if let Some(prefix) = &loose_objects_prefix {
             remove_loose_objects(&root, prefix);
-        }
-
-        // This mtime shift for .rmeta is a workaround as rustc incremental build
-        // since rust-lang/rust#114669 (1.90.0) skips unnecessary rmeta generation.
-        //
-        // The situation is like this:
-        //
-        // 1. When build script execution's external dependendies
-        //    (rerun-if-changed, rerun-if-env-changed) got updated,
-        //    the execution unit reran and got a newer mtime.
-        // 2. rustc type-checked the associated crate, though with incremental
-        //    compilation, no rmeta regeneration. Its `.rmeta` stays old.
-        // 3. Run `cargo check` again. Cargo found build script execution had
-        //    a new mtime than existing crate rmeta, so re-checking the crate.
-        //    However the check is a no-op (input has no change), so stuck.
-        if mode.is_check() {
-            for output in outputs.iter() {
-                paths::set_file_time_no_err(&output.path, timestamp);
-            }
         }
 
         Ok(())
@@ -1383,6 +1362,13 @@ fn add_error_format_and_color(build_runner: &BuildRunner<'_, '_>, cmd: &mut Proc
     {
         json.push_str(",diagnostic-unicode");
     }
+
+    if !build_runner.bcx.gctx.shell().graphics()
+        && build_runner.bcx.gctx.cli_unstable().term_graphics
+    {
+        json.push_str(",diagnostic-no-graphics");
+    }
+
     if enable_timings {
         json.push_str(",timings");
     }
@@ -1820,9 +1806,7 @@ fn build_deps_args(
                     build_runner.files().build_script_out_dir(&dep.unit)
                 };
                 let target_name = dep.unit.target.name();
-                let out_dir_prefix = target_name
-                    .strip_prefix("build-script-")
-                    .unwrap_or(target_name);
+                let out_dir_prefix = target_name.trim_prefix("build-script-");
                 let out_dir_name = format!("{out_dir_prefix}_OUT_DIR");
                 cmd.env(&out_dir_name, &out_dir);
             }

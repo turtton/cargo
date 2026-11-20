@@ -13,9 +13,13 @@
 //!
 //! - [`Value`]: This type provides access to the location where the
 //!   config value was defined.
-//! - [`ConfigRelativePath`]: For a path that is relative to where it is
+//! - [`ConfigRootRelativePath`]: For a path that is relative to where it is
 //!   defined.
-//! - [`PathAndArgs`]: Similar to [`ConfigRelativePath`],
+//! - [`ConfigRootRelativeProgramPath`]: For a path that is relative to where it is
+//!   defined unless it is a bin name to look up in `PATH`
+//! - [`ConfigRootRelativePathTemplate`]: For a templated path that is relative to where it is
+//!   defined.
+//! - [`PathAndArgs`]: Similar to [`ConfigRootRelativePath`],
 //!   but also supports a list of arguments, useful for programs to execute.
 //! - [`StringList`]: Get a value that is either a list or a whitespace split
 //!   string.
@@ -62,7 +66,6 @@
 //! more details.)
 
 use cargo_util::collections::{HashMap, HashSet};
-use std::borrow::Cow;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -82,7 +85,6 @@ use crate::util::cache_lock::{CacheLock, CacheLockMode, CacheLocker};
 use crate::util::errors::CargoResult;
 use crate::util::network::http::{HandleConfiguration, configure_http_handle, http_handle};
 use crate::util::network::http_async;
-use crate::util::restricted_names::is_glob_pattern;
 use crate::util::{CanonicalUrl, closest_msg, internal};
 use crate::util::{Filesystem, IntoUrl, IntoUrlWithBase, Rustc};
 use crate::workspace::global_cache_tracker::{DeferredGlobalLastUse, GlobalCacheTracker};
@@ -92,25 +94,19 @@ use anyhow::{Context as _, anyhow, bail, format_err};
 use cargo_credential::Secret;
 use cargo_util::paths;
 use cargo_util_schemas::manifest::RegistryName;
-use cargo_util_terminal::report::Level;
 use cargo_util_terminal::{Shell, Verbosity};
 use curl::easy::Easy;
 use itertools::Itertools;
-use serde::Deserialize;
-use serde::de::IntoDeserializer as _;
-use time::OffsetDateTime;
-use toml_edit::Item;
+use jiff::Timestamp;
 use url::Url;
 
 pub use crate::config::{
     ConfigError, ConfigKey, ConfigStore, ConfigValue, Definition, DefinitionKind, OptValue, Value,
 };
-use crate::config::{ConfigReader, Env};
+use crate::config::{ConfigReader, Env, MergePriority};
 
-mod path;
-pub use path::BracketType;
-pub use path::ConfigRelativePathResolveExt;
-pub use path::ResolveTemplateError;
+mod loader;
+use loader::ConfigLoader;
 
 mod target;
 pub use target::{TargetCfgConfig, TargetConfig};
@@ -144,7 +140,7 @@ pub const TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
 #[derive(Debug)]
 pub struct CredentialCacheValue {
     pub token_value: Secret<String>,
-    pub expiration: Option<OffsetDateTime>,
+    pub expiration: Option<Timestamp>,
     pub operation_independent: bool,
 }
 
@@ -297,7 +293,7 @@ impl GlobalContext {
             }
         };
 
-        let env = Env::new();
+        let env = Env::from_env();
 
         let cache_key = "CARGO_CACHE_RUSTC_INFO";
         let cache_rustc_info = match env.get_env_os(cache_key) {
@@ -385,7 +381,7 @@ impl GlobalContext {
     /// such as recommending where to add a config value).
     pub fn diagnostic_home_config(&self) -> String {
         let home = self.home_path.as_path_unlocked();
-        let path = match self.get_file_path(home, "config", false) {
+        let path = match self.config_loader().get_file_path(home, "config", false) {
             Ok(Some(existing_path)) => existing_path,
             _ => home.join("config.toml"),
         };
@@ -679,9 +675,11 @@ impl GlobalContext {
     /// Reloads on-disk configuration values, starting at the given path and
     /// walking up its ancestors.
     pub fn reload_rooted_at<P: AsRef<Path>>(&mut self, path: P) -> CargoResult<()> {
-        let config = self.load_config_from(path.as_ref())?;
+        let mut layers = self.config_loader().load_unmerged_from(path.as_ref())?;
+        layers.push(self.cli_args_to_config()?);
+        let config =
+            ConfigStore::from_layers(layers).context("could not load Cargo configuration")?;
         self.config.replace(config);
-        self.merge_cli_args()?;
         self.load_unstable_flags_from_config()?;
         Ok(())
     }
@@ -710,13 +708,13 @@ impl GlobalContext {
 
             Ok(Some(Filesystem::new(self.cwd.join(dir))))
         } else if let Some(val) = &self.build_config()?.target_dir {
-            let path = val.resolve_path(self);
+            let path = val.resolve(self.cwd());
 
             // Check if the target directory is set to an empty string in the config.toml file.
-            if val.raw_value().is_empty() {
+            if val.is_empty() {
                 bail!(
                     "the target directory is set to an empty string in {}",
-                    val.value().definition
+                    val.definition()
                 )
             }
 
@@ -742,7 +740,7 @@ impl GlobalContext {
     /// Callers should prefer [`Workspace::build_dir`] instead.
     pub fn custom_build_dir(
         &self,
-        val: &ConfigRelativePath,
+        val: &ConfigRootRelativePathTemplate,
         workspace_manifest_path: &Path,
     ) -> CargoResult<Filesystem> {
         let replacements = [
@@ -782,9 +780,9 @@ impl GlobalContext {
             .collect_vec();
 
         let path = val
-            .resolve_templated_path(self, replacements)
+            .resolve(self.cwd(), replacements)
             .map_err(|e| match e {
-                path::ResolveTemplateError::UnexpectedVariable {
+                ResolveTemplateError::UnexpectedVariable {
                     variable,
                     raw_template,
                 } => {
@@ -797,10 +795,10 @@ impl GlobalContext {
                             "unexpected variable `{variable}` in build.build-dir path `{raw_template}`{suggestion}"
                         )
                 }
-                path::ResolveTemplateError::UnexpectedBracket { bracket_type, raw_template } => {
+                ResolveTemplateError::UnexpectedBracket { bracket_type, raw_template } => {
                     let (btype, literal) = match bracket_type {
-                        path::BracketType::Opening => ("opening", "{"),
-                        path::BracketType::Closing => ("closing", "}"),
+                        BracketType::Opening => ("opening", "{"),
+                        BracketType::Closing => ("closing", "}"),
                     };
 
                     anyhow!(
@@ -810,10 +808,10 @@ impl GlobalContext {
             })?;
 
         // Check if the target directory is set to an empty string in the config.toml file.
-        if val.raw_value().is_empty() {
+        if val.is_empty() {
             bail!(
                 "the build directory is set to an empty string in {}",
-                val.value().definition
+                val.definition()
             )
         }
 
@@ -821,12 +819,10 @@ impl GlobalContext {
     }
 
     fn config_reader(&self) -> CargoResult<ConfigReader<'_>> {
-        Ok(ConfigReader {
-            store: self.config()?,
-            shell: &self.shell,
-            env: &self.env,
-            advanced_env: self.cli_unstable().advanced_env,
-        })
+        Ok(ConfigReader::new(&self.shell)
+            .config(self.config()?)
+            .env(&self.env)
+            .unstable_advanced_env(self.cli_unstable().advanced_env))
     }
 
     pub(crate) fn get_cv_with_env(&self, key: &ConfigKey) -> CargoResult<Option<CV>> {
@@ -875,16 +871,6 @@ impl GlobalContext {
         self.get::<OptValue<String>>(key)
     }
 
-    fn string_to_path(&self, value: &str, definition: &Definition) -> PathBuf {
-        let is_path = value.contains('/') || (cfg!(windows) && value.contains('\\'));
-        if is_path {
-            definition.root(self.cwd()).join(value)
-        } else {
-            // A pathless name.
-            PathBuf::from(value)
-        }
-    }
-
     /// Update the instance based on settings typically passed in on
     /// the command-line.
     ///
@@ -915,7 +901,11 @@ impl GlobalContext {
         }
         if !cli_config.is_empty() {
             self.cli_config = Some(cli_config.iter().map(|s| s.to_string()).collect());
-            self.merge_cli_args()?;
+            let cli_config = self.cli_args_to_config()?;
+            // Config files may already be loaded and merged, for example to expand aliases.
+            let files = std::mem::take(self.config_mut()?);
+            let config = ConfigStore::from_layers([files, cli_config])?;
+            self.config.replace(config);
         }
 
         self.load_unstable_flags_from_config()?;
@@ -968,6 +958,21 @@ impl GlobalContext {
 
         self.shell()
             .set_unstable_flags_rustc_unicode(self.unstable_flags.rustc_unicode)?;
+
+        // Without this a user could set `NO_GRAPHICS=1` and be able to use an
+        // unstable feature without it being enabled
+        if !self.unstable_flags.term_graphics {
+            self.shell().set_graphics(true)?;
+        }
+
+        if let Some(graphics) = term.graphics {
+            if self.unstable_flags.term_graphics {
+                self.shell().set_graphics(graphics)?;
+            } else {
+                self.shell()
+                    .warn("ignoring `term.graphics` without `-Zterm-graphics`")?;
+            }
+        }
 
         Ok(())
     }
@@ -1033,384 +1038,23 @@ impl GlobalContext {
 
     /// Loads configuration from the filesystem.
     pub fn load_config(&self) -> CargoResult<ConfigStore> {
-        self.load_config_from(&self.cwd)
-    }
-
-    /// Like [`load_config`](GlobalContext::load_config) but without merging config values.
-    ///
-    /// This is primarily crafted for `cargo config` command.
-    pub(crate) fn load_config_unmerged(&self) -> CargoResult<Vec<ConfigStore>> {
-        let mut result = Vec::new();
-        let mut seen = HashSet::default();
-        let home = self.home_path.clone().into_path_unlocked();
-        self.walk_tree(&self.cwd, &home, |path| {
-            let mut config = self._load_file(path, &mut seen, false, DefinitionKind::Path)?;
-            self.load_unmerged_include(&mut config, &mut seen, &mut result)?;
-            result.push(config);
-            Ok(())
-        })
-        .context("could not load Cargo configuration")?;
-        Ok(result)
-    }
-
-    /// Like [`load_includes`](GlobalContext::load_includes) but without merging config values.
-    ///
-    /// This is primarily crafted for `cargo config` command.
-    fn load_unmerged_include(
-        &self,
-        config: &mut ConfigStore,
-        seen: &mut HashSet<PathBuf>,
-        output: &mut Vec<ConfigStore>,
-    ) -> CargoResult<()> {
-        let includes = self.include_paths(config, false)?;
-        for include in includes {
-            let Some(abs_path) = include.resolve_path(self) else {
-                continue;
-            };
-
-            let mut config = self
-                ._load_file(&abs_path, seen, false, DefinitionKind::Path)
-                .with_context(|| {
-                    format!(
-                        "failed to load config include `{}` from `{}`",
-                        include.path.display(),
-                        include.def
-                    )
-                })?;
-            self.load_unmerged_include(&mut config, seen, output)?;
-            output.push(config);
-        }
-        Ok(())
-    }
-
-    /// Start a config file discovery from a path and merges all config values found.
-    fn load_config_from(&self, path: &Path) -> CargoResult<ConfigStore> {
-        let mut cfg = ConfigStore::default();
-        let home = self.home_path.clone().into_path_unlocked();
-
-        self.walk_tree(path, &home, |path| {
-            let config = self.load_file(path)?;
-            cfg.merge(config, false).with_context(|| {
-                format!("failed to merge configuration at `{}`", path.display())
-            })?;
-            Ok(())
-        })
-        .context("could not load Cargo configuration")?;
-
-        Ok(cfg)
-    }
-
-    /// Loads configuration from a path.
-    ///
-    /// This is used during config file discovery.
-    fn load_file(&self, path: &Path) -> CargoResult<ConfigStore> {
-        self._load_file(path, &mut HashSet::default(), true, DefinitionKind::Path)
-    }
-
-    /// Loads configuration from a path with options.
-    ///
-    /// This is the implementation of loading configuration from a path.
-    ///
-    /// * `includes` determines whether to load configs from [`ConfigInclude`].
-    /// * `seen` is used to check for cyclic includes.
-    /// * `definition_kind` tells why a config is being loaded.
-    fn _load_file(
-        &self,
-        path: &Path,
-        seen: &mut HashSet<PathBuf>,
-        includes: bool,
-        definition_kind: DefinitionKind,
-    ) -> CargoResult<ConfigStore> {
-        if !seen.insert(path.to_path_buf()) {
-            bail!(
-                "config `include` cycle detected with path `{}`",
-                path.display()
-            );
-        }
-        tracing::debug!(?path, ?definition_kind, includes, "load config from file");
-
-        let config = ConfigStore::read_layer(path, definition_kind)?;
-
-        if includes {
-            self.load_includes(config, seen, definition_kind)
-        } else {
-            Ok(config)
-        }
-    }
-
-    /// Load any `include` files listed in the given `config`.
-    ///
-    /// Returns `config` with the given include files merged into it.
-    ///
-    /// * `seen` is used to check for cyclic includes.
-    /// * `definition_kind` tells why a config is being loaded.
-    fn load_includes(
-        &self,
-        mut config: ConfigStore,
-        seen: &mut HashSet<PathBuf>,
-        definition_kind: DefinitionKind,
-    ) -> CargoResult<ConfigStore> {
-        // Get the list of files to load.
-        let includes = self.include_paths(&mut config, true)?;
-
-        // Accumulate all values here.
-        let root = CV::Table(HashMap::default(), config.definition().clone());
-        let mut root = ConfigStore::with_table_value(root).unwrap();
-        for include in includes {
-            let Some(abs_path) = include.resolve_path(self) else {
-                continue;
-            };
-
-            self._load_file(&abs_path, seen, true, definition_kind)
-                .and_then(|include| root.merge(include, true))
-                .with_context(|| {
-                    format!(
-                        "failed to load config include `{}` from `{}`",
-                        include.path.display(),
-                        include.def
-                    )
-                })?;
-        }
-        root.merge(config, true)?;
-        Ok(root)
-    }
-
-    /// Converts the `include` config value to a list of absolute paths.
-    fn include_paths(
-        &self,
-        config: &mut ConfigStore,
-        remove: bool,
-    ) -> CargoResult<Vec<ConfigInclude>> {
-        let table = config.values_mut();
-        let include = if remove {
-            table.remove("include").map(Cow::Owned)
-        } else {
-            table.get("include").map(Cow::Borrowed)
-        };
-        let includes = match include.map(|c| c.into_owned()) {
-            Some(CV::List(list, _def)) => list
-                .into_iter()
-                .enumerate()
-                .map(|(idx, cv)| match cv {
-                    CV::String(s, def) => Ok(ConfigInclude::new(s, def)),
-                    CV::Table(mut table, def) => {
-                        // Extract `include.path`
-                        let s = match table.remove("path") {
-                            Some(CV::String(s, _)) => s,
-                            Some(other) => bail!(
-                                "expected a string, but found {} at `include[{idx}].path` in `{def}`",
-                                other.desc()
-                            ),
-                            None => bail!("missing field `path` at `include[{idx}]` in `{def}`"),
-                        };
-
-                        // Extract optional `include.optional` field
-                        let optional = match table.remove("optional") {
-                            Some(CV::Boolean(b, _)) => b,
-                            Some(other) => bail!(
-                                "expected a boolean, but found {} at `include[{idx}].optional` in `{def}`",
-                                other.desc()
-                            ),
-                            None => false,
-                        };
-
-                        let mut include = ConfigInclude::new(s, def);
-                        include.optional = optional;
-                        Ok(include)
-                    }
-                    other => bail!(
-                        "expected a string or table, but found {} at `include[{idx}]` in {}",
-                        other.desc(),
-                        other.definition(),
-                    ),
-                })
-                .collect::<CargoResult<Vec<_>>>()?,
-            Some(other) => bail!(
-                "expected a list of strings or a list of tables, but found {} at `include` in `{}",
-                other.desc(),
-                other.definition()
-            ),
-            None => {
-                return Ok(Vec::new());
-            }
-        };
-
-        for include in &includes {
-            if include.path.extension() != Some(OsStr::new("toml")) {
-                bail!(
-                    "expected a config include path ending with `.toml`, \
-                     but found `{}` from `{}`",
-                    include.path.display(),
-                    include.def,
-                )
-            }
-
-            if let Some(path) = include.path.to_str() {
-                // Ignore non UTF-8 bytes as glob and template syntax are for textual config.
-                if is_glob_pattern(path) {
-                    bail!(
-                        "expected a config include path without glob patterns, \
-                         but found `{}` from `{}`",
-                        include.path.display(),
-                        include.def,
-                    )
-                }
-                if path.contains(&['{', '}']) {
-                    bail!(
-                        "expected a config include path without template braces, \
-                         but found `{}` from `{}`",
-                        include.path.display(),
-                        include.def,
-                    )
-                }
-            }
-        }
-
-        Ok(includes)
+        let layers = self.config_loader().load_unmerged_from(&self.cwd)?;
+        ConfigStore::from_layers(layers).context("could not load Cargo configuration")
     }
 
     /// Parses the CLI config args and returns them as a table.
     pub(crate) fn cli_args_to_config(&self) -> CargoResult<ConfigStore> {
-        let mut loaded_args =
-            ConfigStore::with_table_value(CV::Table(HashMap::default(), Definition::Cli(None)))
-                .unwrap();
-        let Some(cli_args) = &self.cli_config else {
-            return Ok(loaded_args);
-        };
-        let mut seen = HashSet::default();
-        for arg in cli_args {
-            let arg_as_path = self.cwd.join(arg);
-            let arg_config = if !arg.is_empty() && arg_as_path.exists() {
-                // --config path_to_file
-                self._load_file(&arg_as_path, &mut seen, true, DefinitionKind::Cli)
-                    .with_context(|| {
-                        format!("failed to load config from `{}`", arg_as_path.display())
-                    })?
-            } else {
-                let doc = toml_dotted_keys(arg)?;
-                let doc: toml::Value = toml::Value::deserialize(doc.into_deserializer())
-                    .with_context(|| {
-                        format!("failed to parse value from --config argument `{arg}`")
-                    })?;
-
-                if doc
-                    .get("registry")
-                    .and_then(|v| v.as_table())
-                    .and_then(|t| t.get("token"))
-                    .is_some()
-                {
-                    bail!("registry.token cannot be set through --config for security reasons");
-                } else if let Some((k, _)) = doc
-                    .get("registries")
-                    .and_then(|v| v.as_table())
-                    .and_then(|t| t.iter().find(|(_, v)| v.get("token").is_some()))
-                {
-                    bail!(
-                        "registries.{}.token cannot be set through --config for security reasons",
-                        k
-                    );
-                }
-
-                let table = CV::from_toml(Definition::Cli(None), doc)
-                    .with_context(|| format!("failed to convert --config argument `{arg}`"))?;
-                ConfigStore::with_table_value(table).unwrap()
-            };
-            let arg_config = self
-                .load_includes(arg_config, &mut HashSet::default(), DefinitionKind::Cli)
-                .context("failed to load --config include".to_string())?;
-            loaded_args
-                .merge(arg_config, true)
-                .with_context(|| format!("failed to merge --config argument `{arg}`"))?;
-        }
-        Ok(loaded_args)
+        let cli_args = self.cli_config.as_deref().unwrap_or_default();
+        self.config_loader().load_cli_args(cli_args)
     }
 
-    /// Add config arguments passed on the command line.
-    fn merge_cli_args(&mut self) -> CargoResult<()> {
-        let cli_config = self.cli_args_to_config()?;
-        self.config_mut()?.merge(cli_config, true)
-    }
-
-    /// The purpose of this function is to aid in the transition to using
-    /// .toml extensions on Cargo's config files, which were historically not used.
-    /// Both 'config.toml' and 'credentials.toml' should be valid with or without extension.
-    /// When both exist, we want to prefer the one without an extension for
-    /// backwards compatibility, but warn the user appropriately.
-    fn get_file_path(
-        &self,
-        dir: &Path,
-        filename_without_extension: &str,
-        warn: bool,
-    ) -> CargoResult<Option<PathBuf>> {
-        let possible = dir.join(filename_without_extension);
-        let possible_with_extension = dir.join(format!("{}.toml", filename_without_extension));
-
-        if let Ok(possible_handle) = same_file::Handle::from_path(&possible) {
-            if warn {
-                if let Ok(possible_with_extension_handle) =
-                    same_file::Handle::from_path(&possible_with_extension)
-                {
-                    // We don't want to print a warning if the version
-                    // without the extension is just a symlink to the version
-                    // WITH an extension, which people may want to do to
-                    // support multiple Cargo versions at once and not
-                    // get a warning.
-                    if possible_handle != possible_with_extension_handle {
-                        self.shell().warn(format!(
-                            "both `{}` and `{}` exist. Using `{}`",
-                            possible.display(),
-                            possible_with_extension.display(),
-                            possible.display()
-                        ))?;
-                    }
-                } else {
-                    self.shell().print_report(&[
-                        Level::WARNING.secondary_title(
-                            format!(
-                                "`{}` is deprecated in favor of `{filename_without_extension}.toml`",
-                                possible.display(),
-                            )).element(Level::HELP.message(
-                            format!("if you need to support cargo 1.38 or earlier, you can symlink `{filename_without_extension}` to `{filename_without_extension}.toml`")))
-                    ], false)?;
-                }
-            }
-
-            Ok(Some(possible))
-        } else if possible_with_extension.exists() {
-            Ok(Some(possible_with_extension))
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn walk_tree<F>(&self, pwd: &Path, home: &Path, mut walk: F) -> CargoResult<()>
-    where
-        F: FnMut(&Path) -> CargoResult<()>,
-    {
-        let mut seen_dir = HashSet::default();
-
-        for current in paths::ancestors(pwd, self.search_stop_path.as_deref()) {
-            let config_root = current.join(".cargo");
-            if let Some(path) = self.get_file_path(&config_root, "config", true)? {
-                walk(&path)?;
-            }
-
-            let canonical_root = config_root.canonicalize().unwrap_or(config_root);
-            seen_dir.insert(canonical_root);
-        }
-
-        let canonical_home = home.canonicalize().unwrap_or(home.to_path_buf());
-
-        // Once we're done, also be sure to walk the home directory even if it's not
-        // in our history to be sure we pick up that standard location for
-        // information.
-        if !seen_dir.contains(&canonical_home) && !seen_dir.contains(home) {
-            if let Some(path) = self.get_file_path(home, "config", true)? {
-                walk(&path)?;
-            }
-        }
-
-        Ok(())
+    pub(crate) fn config_loader(&self) -> ConfigLoader<'_> {
+        ConfigLoader::new(
+            &self.shell,
+            &self.cwd,
+            self.home_path.as_path_unlocked(),
+            self.search_stop_path.as_deref(),
+        )
     }
 
     /// Gets the index for a registry.
@@ -1460,31 +1104,7 @@ impl GlobalContext {
     /// Gets configuration values from the credentials file, loading them on first use.
     fn credentials_config(&self) -> CargoResult<&ConfigStore> {
         self.credentials_config
-            .try_borrow_with(|| self.load_credentials())
-    }
-
-    /// Loads credentials config from the credentials file, if present.
-    fn load_credentials(&self) -> CargoResult<ConfigStore> {
-        let home_path = self.home_path.clone().into_path_unlocked();
-        let Some(credentials) = self.get_file_path(&home_path, "credentials", true)? else {
-            return Ok(ConfigStore::default());
-        };
-
-        let mut config = ConfigStore::read_layer(&credentials, DefinitionKind::Path)?;
-        // Backwards compatibility for old `.cargo/credentials` layout.
-        {
-            let def = config.definition().clone();
-            let value_map = config.values_mut();
-
-            if let Some(token) = value_map.remove("token") {
-                value_map.entry("registry".into()).or_insert_with(|| {
-                    let map = HashMap::from_iter([("token".into(), token)]);
-                    CV::Table(map, def.clone())
-                });
-            }
-        }
-
-        Ok(config)
+            .try_borrow_with(|| self.config_loader().load_credentials())
     }
 
     /// Looks for a path for `tool` in an environment variable or the given config, and returns
@@ -1492,7 +1112,7 @@ impl GlobalContext {
     fn maybe_get_tool(
         &self,
         tool: &str,
-        from_config: &Option<ConfigRelativePath>,
+        from_config: &Option<ConfigRootRelativeProgramPath>,
     ) -> Option<PathBuf> {
         let var = tool.to_uppercase();
 
@@ -1507,7 +1127,7 @@ impl GlobalContext {
                 Some(path)
             }
 
-            None => from_config.as_ref().map(|p| p.resolve_program(self)),
+            None => from_config.as_ref().map(|p| p.resolve(self.cwd())),
         }
     }
 
@@ -1521,7 +1141,7 @@ impl GlobalContext {
     ///
     /// This is intended for tools that are rustup proxies. If you need to get
     /// a tool that is not a rustup proxy, use `maybe_get_tool` instead.
-    fn get_tool(&self, tool: Tool, from_config: &Option<ConfigRelativePath>) -> PathBuf {
+    fn get_tool(&self, tool: Tool, from_config: &Option<ConfigRootRelativeProgramPath>) -> PathBuf {
         let tool_str = tool.as_str();
         self.maybe_get_tool(tool_str, from_config)
             .or_else(|| {
@@ -2159,7 +1779,10 @@ pub fn save_credentials(
     // Otherwise write to 'credentials.toml'. There's no need to print the
     // warning here, because it would already be printed at load time.
     let home_path = gctx.home_path.clone().into_path_unlocked();
-    let filename = match gctx.get_file_path(&home_path, "credentials", false)? {
+    let filename = match gctx
+        .config_loader()
+        .get_file_path(&home_path, "credentials", false)?
+    {
         Some(path) => match path.file_name() {
             Some(filename) => Path::new(filename).to_owned(),
             None => Path::new("credentials.toml").to_owned(),
@@ -2219,7 +1842,7 @@ pub fn save_credentials(
         if registry.is_some() {
             if let Some(table) = toml.remove("registries") {
                 let v = CV::from_toml(path_def, table)?;
-                value.merge(v, false)?;
+                value.merge(v, MergePriority::Definition)?;
             }
         }
         toml.insert(key, value.into_toml());
@@ -2266,145 +1889,6 @@ pub fn save_credentials(
     fn set_permissions(_file: &File, _mode: u32) -> CargoResult<()> {
         Ok(())
     }
-}
-
-/// Represents a config-include value in the configuration.
-///
-/// This intentionally doesn't derive serde deserialization
-/// to avoid any misuse of `GlobalContext::get::<ConfigInclude>()`,
-/// which might lead to wrong config loading order.
-struct ConfigInclude {
-    /// Path to a config-include configuration file.
-    /// Could be either relative or absolute.
-    path: PathBuf,
-    def: Definition,
-    /// Whether this include is optional (missing files are silently ignored)
-    optional: bool,
-}
-
-impl ConfigInclude {
-    fn new(p: impl Into<PathBuf>, def: Definition) -> Self {
-        Self {
-            path: p.into(),
-            def,
-            optional: false,
-        }
-    }
-
-    /// Resolves the absolute path for this include.
-    ///
-    /// For file based include,
-    /// it is relative to parent directory of the config file includes it.
-    /// For example, if `.cargo/config.toml has a `include = "foo.toml"`,
-    /// Cargo will load `.cargo/foo.toml`.
-    ///
-    /// For CLI based include (e.g., `--config 'include = "foo.toml"'`),
-    /// it is relative to the current working directory.
-    ///
-    /// Returns `None` if this is an optional include and the file doesn't exist.
-    /// Otherwise returns `Some(PathBuf)` with the absolute path.
-    fn resolve_path(&self, gctx: &GlobalContext) -> Option<PathBuf> {
-        let abs_path = match &self.def {
-            Definition::Path(p) | Definition::Cli(Some(p)) => p.parent().unwrap(),
-            Definition::Environment(_) | Definition::Cli(None) | Definition::BuiltIn => gctx.cwd(),
-        }
-        .join(&self.path);
-        let abs_path = paths::normalize_path(&abs_path);
-
-        if self.optional && !abs_path.exists() {
-            tracing::info!(
-                "skipping optional include `{}` in `{}`:  file not found at `{}`",
-                self.path.display(),
-                self.def,
-                abs_path.display(),
-            );
-            None
-        } else {
-            Some(abs_path)
-        }
-    }
-}
-
-fn toml_dotted_keys(arg: &str) -> CargoResult<toml_edit::DocumentMut> {
-    // We only want to allow "dotted key" (see https://toml.io/en/v1.0.0#keys)
-    // expressions followed by a value that's not an "inline table"
-    // (https://toml.io/en/v1.0.0#inline-table). Easiest way to check for that is to
-    // parse the value as a toml_edit::DocumentMut, and check that the (single)
-    // inner-most table is set via dotted keys.
-    let doc: toml_edit::DocumentMut = arg.parse().with_context(|| {
-        format!("failed to parse value from --config argument `{arg}` as a dotted key expression")
-    })?;
-    fn non_empty(d: Option<&toml_edit::RawString>) -> bool {
-        d.map_or(false, |p| !p.as_str().unwrap_or_default().trim().is_empty())
-    }
-    fn non_empty_decor(d: &toml_edit::Decor) -> bool {
-        non_empty(d.prefix()) || non_empty(d.suffix())
-    }
-    fn non_empty_key_decor(k: &toml_edit::Key) -> bool {
-        non_empty_decor(k.leaf_decor()) || non_empty_decor(k.dotted_decor())
-    }
-    let ok = {
-        let mut got_to_value = false;
-        let mut table = doc.as_table();
-        let mut is_root = true;
-        while table.is_dotted() || is_root {
-            is_root = false;
-            if table.len() != 1 {
-                break;
-            }
-            let (k, n) = table.iter().next().expect("len() == 1 above");
-            match n {
-                Item::Table(nt) => {
-                    if table.key(k).map_or(false, non_empty_key_decor)
-                        || non_empty_decor(nt.decor())
-                    {
-                        bail!(
-                            "--config argument `{arg}` \
-                                includes non-whitespace decoration"
-                        )
-                    }
-                    table = nt;
-                }
-                Item::Value(v) if v.is_inline_table() => {
-                    bail!(
-                        "--config argument `{arg}` \
-                        sets a value to an inline table, which is not accepted"
-                    );
-                }
-                Item::Value(v) => {
-                    if table
-                        .key(k)
-                        .map_or(false, |k| non_empty(k.leaf_decor().prefix()))
-                        || non_empty_decor(v.decor())
-                    {
-                        bail!(
-                            "--config argument `{arg}` \
-                                includes non-whitespace decoration"
-                        )
-                    }
-                    got_to_value = true;
-                    break;
-                }
-                Item::ArrayOfTables(_) => {
-                    bail!(
-                        "--config argument `{arg}` \
-                        sets a value to an array of tables, which is not accepted"
-                    );
-                }
-
-                Item::None => {
-                    bail!("--config argument `{arg}` doesn't provide a value")
-                }
-            }
-        }
-        got_to_value
-    };
-    if !ok {
-        bail!(
-            "--config argument `{arg}` was not a TOML dotted key expression (such as `build.jobs = 2`)"
-        );
-    }
-    Ok(doc)
 }
 
 #[macro_export]

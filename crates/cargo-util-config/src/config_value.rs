@@ -13,7 +13,7 @@ use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
 
-use super::key::{KeyOrIdx, escape_key_part};
+use super::key::KeyOrIdx;
 use super::{ConfigKey, Definition};
 
 use self::ConfigValue as CV;
@@ -69,17 +69,19 @@ impl fmt::Debug for ConfigValue {
 
 impl ConfigValue {
     pub fn from_toml(def: Definition, toml: toml::Value) -> Result<ConfigValue> {
+        use toml_writer::TomlWrite as _;
+
         let mut error_path = Vec::new();
         Self::from_toml_inner(def, toml, &mut error_path).with_context(|| {
             let mut it = error_path.iter().rev().peekable();
             let mut key_path = String::with_capacity(error_path.len() * 3);
             while let Some(k) = it.next() {
                 match k {
-                    KeyOrIdx::Key(s) => key_path.push_str(&escape_key_part(&s)),
+                    KeyOrIdx::Key(s) => key_path.key(s).unwrap(),
                     KeyOrIdx::Idx(i) => key_path.push_str(&format!("[{i}]")),
                 }
                 if matches!(it.peek(), Some(KeyOrIdx::Key(_))) {
-                    key_path.push('.');
+                    key_path.key_sep().unwrap();
                 }
             }
             format!("failed to parse config at `{key_path}`")
@@ -137,13 +139,14 @@ impl ConfigValue {
 
     /// Merge the given value into self.
     ///
-    /// If `force` is true, primitive (non-container) types will override existing values
-    /// of equal priority. For arrays, incoming values of equal priority will be placed later.
-    ///
-    /// Container types (tables and arrays) are merged with existing values.
+    /// Tables merge recursively. [`MergePriority`] controls value replacement and list ordering.
     ///
     /// Container and non-container types cannot be mixed.
-    pub fn merge(&mut self, from: ConfigValue, force: bool) -> Result<()> {
+    pub fn merge(&mut self, from: ConfigValue, priority: MergePriority) -> Result<()> {
+        let force = match priority {
+            MergePriority::Definition => false,
+            MergePriority::From => true,
+        };
         self.merge_helper(from, force, &mut ConfigKey::new())
     }
 
@@ -155,11 +158,12 @@ impl ConfigValue {
     ) -> Result<()> {
         let is_higher_priority = from.definition().is_higher_priority(self.definition());
         match (self, from) {
-            (&mut CV::List(ref mut old, _), CV::List(ref mut new, _)) => {
+            (&mut CV::List(ref mut old, ref mut old_def), CV::List(ref mut new, new_def)) => {
                 if is_nonmergeable_list(&parts) {
                     // Use whichever list is higher priority.
                     if force || is_higher_priority {
                         mem::swap(new, old);
+                        *old_def = new_def;
                     }
                 } else {
                     // Merge the lists together.
@@ -302,6 +306,25 @@ impl ConfigValue {
             self.definition()
         )
     }
+}
+
+/// Policy for merging [`ConfigValue`]s
+///
+/// For scalar or non-mergeable lists, controls which wins when merging configuration values.
+///
+/// For mergeable lists, retain both sides, ordered by definition priority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MergePriority {
+    /// Defer to [`Definition`]
+    ///
+    /// Prefer the higher-priority definition, keeping the existing value on a tie.
+    /// For mergeable lists, incoming entries come first among entries of equal priority.
+    Definition,
+    /// Defer to the new layer.
+    ///
+    /// Prefer the incoming value regardless of its definition.
+    /// For mergeable lists, incoming entries come last among entries of equal priority.
+    From,
 }
 
 pub(crate) fn is_nonmergeable_list(key: &ConfigKey) -> bool {

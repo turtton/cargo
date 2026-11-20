@@ -12,10 +12,7 @@ use crate::prelude::*;
 use cargo::CargoResult;
 use cargo::context::RegistryConfig;
 use cargo::context::Value;
-use cargo::context::{
-    self, ConfigRelativePathResolveExt, Definition, GlobalContext, JobsConfig, SslVersionConfig,
-    StringList,
-};
+use cargo::context::{self, Definition, GlobalContext, JobsConfig, SslVersionConfig, StringList};
 use cargo::workspace::PackageIdSpec;
 use cargo::workspace::features::{GitFeatures, GitoxideFeatures};
 use cargo_test_support::compare::assert_e2e;
@@ -656,10 +653,10 @@ Caused by:
     assert_error(
         gctx.unwrap_err(),
         str![[r#"
-failed to merge key `a` between [ROOT]/.cargo/config.toml and --config cli option
+failed to merge key `a` between --config cli option and [ROOT]/.cargo/config.toml
 
 Caused by:
-  failed to merge config value from `--config cli option` into `[ROOT]/.cargo/config.toml`: expected boolean, but found array
+  failed to merge config value from `[ROOT]/.cargo/config.toml` into `--config cli option`: expected array, but found boolean
 "#]],
     );
 
@@ -1041,33 +1038,33 @@ abs = '{}'
         .build();
 
     assert_eq!(
-        gctx.get::<context::ConfigRelativePath>(["p1"])
+        gctx.get::<context::ConfigRootRelativePath>(["p1"])
             .unwrap()
-            .resolve_path(&gctx),
+            .resolve(gctx.cwd()),
         paths::root().join("foo/bar")
     );
     assert_eq!(
-        gctx.get::<context::ConfigRelativePath>(["p2"])
+        gctx.get::<context::ConfigRootRelativePath>(["p2"])
             .unwrap()
-            .resolve_path(&gctx),
+            .resolve(gctx.cwd()),
         paths::root().join("../abc")
     );
     assert_eq!(
-        gctx.get::<context::ConfigRelativePath>(["p3"])
+        gctx.get::<context::ConfigRootRelativePath>(["p3"])
             .unwrap()
-            .resolve_path(&gctx),
+            .resolve(gctx.cwd()),
         paths::root().join("d/e")
     );
     assert_eq!(
-        gctx.get::<context::ConfigRelativePath>(["abs"])
+        gctx.get::<context::ConfigRootRelativePath>(["abs"])
             .unwrap()
-            .resolve_path(&gctx),
+            .resolve(gctx.cwd()),
         paths::home()
     );
     assert_eq!(
-        gctx.get::<context::ConfigRelativePath>(["epath"])
+        gctx.get::<context::ConfigRootRelativePath>(["epath"])
             .unwrap()
-            .resolve_path(&gctx),
+            .resolve(gctx.cwd()),
         paths::root().join("a/b")
     );
 }
@@ -1347,9 +1344,6 @@ fn table_merge_failure() {
         gctx.get::<Table>(["table"]).unwrap_err(),
         str![[r#"
 could not load Cargo configuration
-
-Caused by:
-  failed to merge configuration at `[ROOT]/.cargo/config.toml`
 
 Caused by:
   failed to merge key `table` between [ROOT]/foo/.cargo/config.toml and [ROOT]/.cargo/config.toml
@@ -2186,8 +2180,12 @@ credential-provider = ['c', 'd']
         .unwrap()
         .credential_provider
         .unwrap();
-    assert_eq!(provider.path.raw_value(), "c");
+    assert_eq!(provider.path.as_str(), "c");
     assert_eq!(provider.args, ["d"]);
+    assert_e2e().eq(
+        provider.path.definition().to_string(),
+        str!["[ROOT]/foo/.cargo/config.toml"],
+    );
 
     let cli_arg = "registries.example.credential-provider=['cli', 'cli-arg']";
     let gctx = GlobalContextBuilder::new()
@@ -2201,8 +2199,12 @@ credential-provider = ['c', 'd']
         .credential_provider
         .unwrap();
     // expect: no merge happens; config CLI takes precedence
-    assert_eq!(provider.path.raw_value(), "cli");
+    assert_eq!(provider.path.as_str(), "cli");
     assert_eq!(provider.args, ["cli-arg"]);
+    assert_e2e().eq(
+        provider.path.definition().to_string(),
+        str!["--config cli option"],
+    );
 
     let env = "CARGO_REGISTRIES_EXAMPLE_CREDENTIAL_PROVIDER";
     let gctx = GlobalContextBuilder::new()
@@ -2216,8 +2218,12 @@ credential-provider = ['c', 'd']
         .credential_provider
         .unwrap();
     // expect: no merge happens; env takes precedence over files
-    assert_eq!(provider.path.raw_value(), "env");
+    assert_eq!(provider.path.as_str(), "env");
     assert_eq!(provider.args, ["env-arg"]);
+    assert_e2e().eq(
+        provider.path.definition().to_string(),
+        str!["environment variable `CARGO_REGISTRIES_EXAMPLE_CREDENTIAL_PROVIDER`"],
+    );
 
     let gctx = GlobalContextBuilder::new()
         .env(env, "env env-arg")
@@ -2231,8 +2237,12 @@ credential-provider = ['c', 'd']
         .credential_provider
         .unwrap();
     // expect: no merge happens; cli takes precedence over files and env
-    assert_eq!(provider.path.raw_value(), "cli");
+    assert_eq!(provider.path.as_str(), "cli");
     assert_eq!(provider.args, ["cli-arg"]);
+    assert_e2e().eq(
+        provider.path.definition().to_string(),
+        str!["--config cli option"],
+    );
 }
 
 #[cargo_test]
@@ -2652,7 +2662,7 @@ fn mixed_type_array() {
                     definition: Definition::Cli(None),
                 },
             ],
-            definition: Definition::Environment("CARGO_A".into()),
+            definition: Definition::Cli(None),
         }
     );
 }

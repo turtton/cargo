@@ -1,6 +1,9 @@
 //! See [`JobState`].
 
-use std::{cell::Cell, marker, sync::Arc};
+use std::cell::Cell;
+use std::marker;
+use std::mem::DropGuard;
+use std::sync::Arc;
 
 use cargo_util::ProcessBuilder;
 
@@ -198,21 +201,25 @@ impl<'a, 'gctx> JobState<'a, 'gctx> {
         job: Job,
         fingerprint: Option<Arc<crate::compiler::fingerprint::Fingerprint>>,
     ) {
-        let mut sender = FinishOnDrop {
-            messages: &self.messages,
-            id: self.id,
-            result: None,
-        };
-        sender.result = Some(job.run(&self));
-        if sender.result.as_ref().unwrap().is_ok() {
+        // Use a DropGuard to guarantee that
+        // a `Finish` message is sent even if our job panics.
+        // We shouldn't panic unless there's a bug in Cargo,
+        // so we just need to make sure nothing hangs by accident.
+        let on_panic = DropGuard::new((), |()| {
+            let err = Err(anyhow::format_err!("worker panicked"));
+            self.messages
+                .push(Message::Finish(self.id, Artifact::All, err));
+        });
+        let mut result = job.run(&self);
+        if result.is_ok() {
             if let Some(fingerprint) = fingerprint {
                 fingerprint.mark_completed();
             }
         }
 
-        if sender.result.as_ref().unwrap().is_ok() {
+        if result.is_ok() {
             if let Err(error) = self.test_hook.event("JobCompleted") {
-                sender.result = Some(Err(error));
+                result = Err(error);
             }
         }
 
@@ -228,31 +235,14 @@ impl<'a, 'gctx> JobState<'a, 'gctx> {
         // we'll just naturally abort the compilation operation but for 1
         // we need to make sure that the metadata is flagged as produced so
         // send a synthetic message here.
-        if self.rmeta_required.get() && sender.result.as_ref().unwrap().is_ok() {
+        if self.rmeta_required.get() && result.is_ok() {
             self.messages
                 .push(Message::Finish(self.id, Artifact::Metadata, Ok(())));
         }
 
-        // Use a helper struct with a `Drop` implementation to guarantee
-        // that a `Finish` message is sent even if our job panics. We
-        // shouldn't panic unless there's a bug in Cargo, so we just need
-        // to make sure nothing hangs by accident.
-        struct FinishOnDrop<'a> {
-            messages: &'a Queue<Message>,
-            id: JobId,
-            result: Option<CargoResult<()>>,
-        }
-
-        impl Drop for FinishOnDrop<'_> {
-            fn drop(&mut self) {
-                let result = self
-                    .result
-                    .take()
-                    .unwrap_or_else(|| Err(anyhow::format_err!("worker panicked")));
-                self.messages
-                    .push(Message::Finish(self.id, Artifact::All, result));
-            }
-        }
+        DropGuard::dismiss(on_panic);
+        self.messages
+            .push(Message::Finish(self.id, Artifact::All, result));
     }
 
     pub fn future_incompat_report(&self, report: Vec<FutureBreakageItem>) {

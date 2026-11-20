@@ -22,10 +22,10 @@
 //!   See the section below on "Mtime comparison" for more details. There
 //!   are essentially two parts to mtime tracking:
 //!
-//!   1. The mtime of a Unit's output files is compared to the mtime of all
-//!      its dependencies' output file mtimes (see
-//!      [`check_filesystem`]). If any output is missing, or is
-//!      older than a dependency's output, then the unit is dirty.
+//!   1. The mtime of a Unit's invocation timestamp is compared to the
+//!      invocation timestamps of all its dependencies (see
+//!      [`check_filesystem`]). If any output is missing, or the unit's
+//!      timestamp is older than a dependency's, then the unit is dirty.
 //!   2. The mtime of a Unit's source files is compared to the mtime of its
 //!      dep-info file in the fingerprint directory (see [`find_stale_file`]).
 //!      The dep-info file is used as an anchor to know when the last build of
@@ -79,7 +79,7 @@
 //! `__CARGO_DEFAULT_LIB_METADATA`[^4]         |             | ✓                        | ✓
 //! `__CARGO_RUSTC_BOOTSTRAP_WS_REMAP`[^2]     | ✓           |                          |
 //! `package_id`                               |             | ✓                        | ✓
-//! Target src path relative to ws             | ✓           |                          |
+//! Target src path relative to ws[^9]         | ✓           |                          |
 //! Target flags (test/bench/for_host/edition) | ✓           |                          |
 //! -C incremental=… flag                      | ✓           |                          |
 //! mtime of sources                           | ✓[^3]       |                          |
@@ -111,6 +111,9 @@
 //!
 //! [^8]: including `-Cextra-filename`
 //!
+//! [^9]: Absolute source paths, for example registry deps,
+//!       are hashed after remapping when `trim-paths` is enabled.
+//!
 //! When deciding what should go in the Metadata vs the Fingerprint, consider
 //! that some files (like dylibs) do not have a hash in their filename. Thus,
 //! if a value changes, only the fingerprint will detect the change (consider,
@@ -134,10 +137,10 @@
 //! - A "dep-info" file which is a translation of rustc's `*.d` dep-info files
 //!   to a Cargo-specific format that tweaks file names and is optimized for
 //!   reading quickly.
-//! - An `invoked.timestamp` file whose filesystem mtime is updated every time
-//!   the Unit is built. This is used for capturing the time when the build
-//!   starts, to detect if files are changed in the middle of the build. See
-//!   below for more details.
+//! - A `.timestamp` file whose filesystem mtime is updated every time
+//!   the Unit is built. This captures when the build starts, to track
+//!   when units were built and detect files changed during the build.
+//!   See below for more details.
 //!
 //! Note that some units are a little different. A Unit for *running* a build
 //! script or for `rustdoc` does not have a dep-info file (it's not
@@ -226,9 +229,9 @@
 //! The status of whether or not the mtime is "stale" or "up-to-date" is
 //! stored in [`Fingerprint::fs_status`].
 //!
-//! All units will compare the mtime of its newest output file with the mtimes
-//! of the outputs of all its dependencies. If any output file is missing,
-//! then the unit is stale. If any dependency is newer, the unit is stale.
+//! All units compare their invocation timestamp with those of their dependencies.
+//! If any output file is missing, then the unit is stale.
+//! If any dependency is newer, the unit is stale.
 //!
 //! #### Normal package mtime handling
 //!
@@ -247,7 +250,7 @@
 //!
 //! When a build is complete, the mtime of the dep-info file in the
 //! fingerprint directory is modified to rewind it to the time when the build
-//! started. This is done by creating an `invoked.timestamp` file when the
+//! started. This is done by creating a `.timestamp` file when the
 //! build starts to capture the start time. The mtime is rewound to the start
 //! to handle the case where the user modifies a source file while a build is
 //! running. Cargo can't know whether or not the file was included in the
@@ -395,6 +398,7 @@ use std::time::SystemTime;
 use anyhow::Context as _;
 use anyhow::format_err;
 use cargo_util::paths;
+use cargo_util_schemas::manifest::TomlTrimPaths;
 use filetime::FileTime;
 use serde::de;
 use serde::ser;
@@ -584,8 +588,10 @@ struct DepFingerprint {
     public: bool,
     /// Whether or not this dependency is an rmeta dependency or a "full"
     /// dependency. In the case of an rmeta dependency our dependency edge only
-    /// actually requires the rmeta from what we depend on, so when checking
-    /// mtime information all files other than the rmeta can be ignored.
+    /// requires the rmeta from what we depend on, so a freshness check that runs
+    /// while the dependency still produces its other outputs (pipelining)
+    /// must only look for the rmeta. Only the execution-time freshness probe
+    /// reads it; mtimes come from the dependency's `.timestamp` file.
     only_requires_rmeta: bool,
     /// The dependency's fingerprint we recursively point to, containing all the
     /// other hash information we'd otherwise need.
@@ -666,6 +672,10 @@ pub struct Fingerprint {
     /// fingerprints output files are regenerated and look newer than this one.
     #[serde(skip)]
     outputs: Vec<PathBuf>,
+    /// The `.timestamp` file of this unit, whose mtime is the time its last
+    /// build started. Dependents compare against it instead of output mtimes.
+    #[serde(skip)]
+    timestamp_file: Option<PathBuf>,
     /// True only after all outputs and the fingerprint have been committed.
     #[serde(skip)]
     completed: AtomicBool,
@@ -697,10 +707,11 @@ pub enum FsStatus {
     /// A dependency's fingerprint was stale.
     StaleDepFingerprint { unit: UnitIndex },
 
-    /// This unit is up-to-date. All outputs and their corresponding mtime are
-    /// listed in the payload here for other dependencies to compare against.
+    /// This unit is up-to-date. `mtime` is the mtime of the unit's
+    /// `.timestamp` file for dependents to compare against. It is `None` if
+    /// the unit has no outputs.
     #[serde(skip)]
-    UpToDate { mtimes: HashMap<PathBuf, FileTime> },
+    UpToDate { mtime: Option<FileTime> },
 }
 
 impl FsStatus {
@@ -767,14 +778,14 @@ impl<'de> Deserialize<'de> for DepFingerprint {
             pkg_id,
             name: name.into(),
             public,
+            // This field is never read since it's only used by the
+            // execution-time probe, which isn't used by fingerprints loaded
+            // from disk.
+            only_requires_rmeta: false,
             fingerprint: Arc::new(Fingerprint {
                 memoized_hash: Mutex::new(Some(hash)),
                 ..Fingerprint::new()
             }),
-            // This field is never read since it's only used in
-            // `check_filesystem` which isn't used by fingerprints loaded from
-            // disk.
-            only_requires_rmeta: false,
         })
     }
 }
@@ -926,6 +937,7 @@ pub(super) struct PreparedFreshnessProbe {
     fingerprint: Arc<Fingerprint>,
     pkg: FreshnessPackage,
     loc: PathBuf,
+    timestamp_file: PathBuf,
     build_root: PathBuf,
     ws_root: PathBuf,
     cargo_exe: PathBuf,
@@ -1037,6 +1049,7 @@ impl PreparedFreshnessProbe {
             fingerprint: calculate(build_runner, unit)?,
             pkg: FreshnessPackage::new(&unit.pkg),
             loc: build_runner.files().fingerprint_file_path(unit, ""),
+            timestamp_file: build_runner.files().timestamp_file(unit),
             build_root: build_root(build_runner, unit),
             ws_root: build_runner.bcx.ws.root().to_path_buf(),
             cargo_exe: build_runner.bcx.gctx.cargo_exe()?.to_path_buf(),
@@ -1157,6 +1170,7 @@ impl PreparedFreshnessProbe {
             &self.cargo_exe,
             &self.environment,
             shared_files,
+            &self.timestamp_file,
         )?;
         let fresh =
             fingerprint.fs_status.up_to_date() && on_disk == util::to_hex(fingerprint.hash_u64());
@@ -1185,11 +1199,40 @@ impl Fingerprint {
         visit(self, &mut HashSet::default())
     }
 
-    /// Refresh dependency output mtimes, never their planning-time fs_status.
+    /// Refresh dependency invocation timestamps, never their planning-time fs_status.
     /// Memoize this invocation's snapshots, not filesystem results across probes:
     /// diamond-shaped dependency graphs must not expand exponentially.
     fn execution_snapshot(&self) -> CargoResult<Self> {
         self.execution_snapshot_inner(&mut HashMap::default())
+    }
+
+    /// The status of this unit's own outputs on disk right now, for dependents
+    /// to compare against: the same facts [`Fingerprint::check_filesystem`]
+    /// derives for the unit, without looking at its inputs. A dependent whose
+    /// edge only requires the rmeta (`only_requires_rmeta`) must not need the
+    /// other outputs: with pipelining it runs while they are still being
+    /// produced.
+    fn current_fs_status(&self, only_requires_rmeta: bool) -> CargoResult<FsStatus> {
+        for output in &self.outputs {
+            if only_requires_rmeta && output.extension().is_none_or(|e| e != "rmeta") {
+                continue;
+            }
+            if optional_file(fs::metadata(output), output)?.is_none() {
+                return Ok(FsStatus::Stale);
+            }
+        }
+        if self.outputs.is_empty() {
+            return Ok(FsStatus::UpToDate { mtime: None });
+        }
+        let Some(timestamp_file) = &self.timestamp_file else {
+            return Ok(FsStatus::Stale);
+        };
+        Ok(
+            match optional_file(paths::mtime(timestamp_file), timestamp_file)? {
+                Some(mtime) => FsStatus::UpToDate { mtime: Some(mtime) },
+                None => FsStatus::Stale,
+            },
+        )
     }
 
     fn execution_snapshot_inner(
@@ -1207,15 +1250,7 @@ impl Fingerprint {
                 continue;
             }
             let mut snapshot = dep.fingerprint.execution_snapshot_inner(cache)?;
-            let mtimes: Option<HashMap<_, _>> = snapshot
-                .outputs
-                .iter()
-                .filter(|p| !dep.only_requires_rmeta || p.extension().is_some_and(|e| e == "rmeta"))
-                .map(|p| Ok(optional_file(paths::mtime(p), p)?.map(|mtime| (p.clone(), mtime))))
-                .collect::<CargoResult<Option<_>>>()?;
-            snapshot.fs_status = mtimes
-                .map(|mtimes| FsStatus::UpToDate { mtimes })
-                .unwrap_or(FsStatus::Stale);
+            snapshot.fs_status = snapshot.current_fs_status(dep.only_requires_rmeta)?;
             dep.fingerprint = Arc::new(snapshot);
             cache.insert(key, Arc::clone(&dep.fingerprint));
         }
@@ -1235,6 +1270,7 @@ impl Fingerprint {
             index: self.index,
             fs_status: FsStatus::Stale,
             outputs: self.outputs.clone(),
+            timestamp_file: self.timestamp_file.clone(),
             completed: AtomicBool::new(self.completed.load(Ordering::Acquire)),
         })
     }
@@ -1401,6 +1437,7 @@ impl Fingerprint {
             index: UnitIndex::default(),
             fs_status: FsStatus::Stale,
             outputs: Vec::new(),
+            timestamp_file: None,
             completed: AtomicBool::new(false),
         }
     }
@@ -1614,45 +1651,46 @@ impl Fingerprint {
         cargo_exe: &Path,
         environment: &FreshnessEnvironment,
         shared_files: Option<&HashSet<PathBuf>>,
+        timestamp_file: &Path,
     ) -> CargoResult<()> {
         assert!(!self.fs_status.up_to_date());
 
         let pkg_root = &pkg.root;
-        let mut mtimes = HashMap::default();
 
-        // Get the `mtime` of all outputs. Optionally update their mtime
-        // afterwards based on the `mtime_on_use` flag. Afterwards we want the
-        // minimum mtime as it's the one we'll be comparing to inputs and
-        // dependencies.
         for output in self.outputs.iter() {
-            let Some(mtime) = optional_file(paths::mtime(output), output)? else {
-                // This path failed to report its `mtime`. It probably doesn't
-                // exists, so leave ourselves as stale and bail out.
+            if optional_file(std::fs::metadata(output), output)?.is_none() {
+                // This output probably doesn't exist, so leave ourselves as
+                // stale and bail out.
                 let item = StaleItem::FailedToReadMetadata {
                     path: output.clone(),
                 };
                 self.fs_status = FsStatus::StaleItem(item);
                 return Ok(());
-            };
-            assert!(mtimes.insert(output.clone(), mtime).is_none());
+            }
         }
-
-        let opt_max = mtimes.iter().max_by_key(|kv| kv.1);
-        let Some((max_path, max_mtime)) = opt_max else {
+        if self.outputs.is_empty() {
             // We had no output files. This means we're an overridden build
             // script and we're just always up to date because we aren't
             // watching the filesystem.
-            self.fs_status = FsStatus::UpToDate { mtimes };
+            self.fs_status = FsStatus::UpToDate { mtime: None };
+            return Ok(());
+        }
+
+        let Some(mtime) = optional_file(paths::mtime(timestamp_file), timestamp_file)? else {
+            let item = StaleItem::FailedToReadMetadata {
+                path: timestamp_file.to_path_buf(),
+            };
+            self.fs_status = FsStatus::StaleItem(item);
             return Ok(());
         };
-        debug!(
-            "max output mtime for {:?} is {:?} {}",
-            pkg_root, max_path, max_mtime
-        );
+        debug!("mtime for {pkg_root:?} is {mtime:?}");
 
         for dep in self.deps.iter() {
-            let dep_mtimes = match &dep.fingerprint.fs_status {
-                FsStatus::UpToDate { mtimes } => mtimes,
+            let dep_mtime = match &dep.fingerprint.fs_status {
+                FsStatus::UpToDate { mtime: Some(mtime) } => *mtime,
+                // If our dependency is up to date and has no filesystem
+                // interactions, then we can move on to the next dependency.
+                FsStatus::UpToDate { mtime: None } => continue,
                 // If our dependency is stale, so are we, so bail out.
                 FsStatus::Stale
                 | FsStatus::StaleItem(_)
@@ -1665,46 +1703,23 @@ impl Fingerprint {
                 }
             };
 
-            // If our dependency edge only requires the rmeta file to be present
-            // then we only need to look at that one output file, otherwise we
-            // need to consider all output files to see if we're out of date.
-            let (dep_path, dep_mtime) = if dep.only_requires_rmeta {
-                dep_mtimes
-                    .iter()
-                    .find(|(path, _mtime)| {
-                        path.extension().and_then(|s| s.to_str()) == Some("rmeta")
-                    })
-                    .expect("failed to find rmeta")
-            } else {
-                match dep_mtimes.iter().max_by_key(|kv| kv.1) {
-                    Some(dep_mtime) => dep_mtime,
-                    // If our dependencies is up to date and has no filesystem
-                    // interactions, then we can move on to the next dependency.
-                    None => continue,
-                }
-            };
-            debug!(
-                "max dep mtime for {:?} is {:?} {}",
-                pkg_root, dep_path, dep_mtime
-            );
-
-            // If the dependency is newer than our own output then it was
-            // recompiled previously. We transitively become stale ourselves in
-            // that case, so bail out.
+            // If the dependency was built after us then it was recompiled
+            // previously. We transitively become stale ourselves in that case,
+            // so bail out.
             //
             // Note that this comparison should probably be `>=`, not `>`, but
             // for a discussion of why it's `>` see the discussion about #5918
             // below in `find_stale`.
-            if dep_mtime > max_mtime {
+            if dep_mtime > mtime {
                 info!(
                     "dependency on `{}` is newer than we are {} > {} {:?}",
-                    dep.name, dep_mtime, max_mtime, pkg_root
+                    dep.name, dep_mtime, mtime, pkg_root
                 );
 
                 self.fs_status = FsStatus::StaleDependency {
                     unit: dep.fingerprint.index,
-                    dep_mtime: *dep_mtime,
-                    max_mtime: *max_mtime,
+                    dep_mtime,
+                    max_mtime: mtime,
                 };
 
                 return Ok(());
@@ -1733,7 +1748,7 @@ impl Fingerprint {
         }
 
         // Everything was up to date! Record such.
-        self.fs_status = FsStatus::UpToDate { mtimes };
+        self.fs_status = FsStatus::UpToDate { mtime: Some(mtime) };
         debug!("filesystem up-to-date {:?}", pkg_root);
 
         Ok(())
@@ -1920,6 +1935,8 @@ fn calculate(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult
         .map(|s| s.reuse(unit, &build_runner.files().build_unit_dir(unit)))
         .transpose()?
         .flatten();
+    let timestamp_file = build_runner.files().timestamp_file(unit);
+    fingerprint.timestamp_file = Some(timestamp_file.clone());
     match reuse {
         Some(Reuse::Rebuild(marker)) => {
             fingerprint.fs_status = FsStatus::StaleItem(StaleItem::MissingFile { path: marker });
@@ -1938,6 +1955,7 @@ fn calculate(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult
                 cargo_exe,
                 &FreshnessEnvironment::new(build_runner.bcx.gctx)?,
                 shared_files,
+                &timestamp_file,
             )?;
         }
     }
@@ -2111,13 +2129,35 @@ fn calculate_normal(
     let mut declared_features = unit.pkg.summary().features().keys().collect::<Vec<_>>();
     declared_features.sort(); // to avoid useless rebuild if the user orders it's features
     // differently
+
+    let src_path = {
+        // Note that .0 is hashed here, not .1 which is the cwd. That doesn't
+        // actually affect the output artifact so there's no need to hash it.
+        let src_path = path_args(build_runner.bcx.ws, unit).0;
+
+        // Some CI has random CI path for different runs.
+        // By tracking remapped paths, we avoid rebuilds when `CARGO_HOME` moves.
+        // See rust-lang/cargo#10915
+        let should_remap = match unit.profile.trim_paths {
+            TomlTrimPaths::None => false,
+            TomlTrimPaths::Object | TomlTrimPaths::All => true,
+        };
+
+        if should_remap
+            && src_path.is_absolute()
+            && let Some(remapped) = super::trim_paths::remap_path(build_runner, unit, &src_path)
+        {
+            remapped
+        } else {
+            src_path
+        }
+    };
+
     Ok(Fingerprint {
         rustc: util::hash_u64(&build_runner.bcx.rustc().verbose_version),
         target: util::hash_u64(&unit.target),
         profile: profile_hash,
-        // Note that .0 is hashed here, not .1 which is the cwd. That doesn't
-        // actually affect the output artifact so there's no need to hash it.
-        path: util::hash_u64(path_args(build_runner.bcx.ws, unit).0),
+        path: util::hash_u64(src_path),
         features: format!("{:?}", unit.features),
         declared_features: format!("{declared_features:?}"),
         deps,
@@ -2129,6 +2169,7 @@ fn calculate_normal(
         rustflags: extra_flags,
         fs_status: FsStatus::Stale,
         outputs,
+        timestamp_file: None,
         completed: AtomicBool::new(false),
     })
 }
@@ -2362,7 +2403,7 @@ fn local_fingerprints_deps(
         let paths = deps
             .rerun_if_changed
             .iter()
-            .map(|p| p.strip_prefix(pkg_root).unwrap_or(p).to_path_buf())
+            .map(|p| p.trim_prefix(pkg_root).to_path_buf())
             .collect();
         local.push(LocalFingerprint::RerunIfChanged { output, paths });
     }
@@ -2724,9 +2765,12 @@ mod execution_tests {
     fn execution_snapshot_ignores_planning_output_cache() {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("lib.rlib");
+        let timestamp = dir.path().join("lib.timestamp");
         fs::write(&output, "complete").unwrap();
+        fs::write(&timestamp, "").unwrap();
         let mut dependency = Fingerprint::new();
         dependency.outputs.push(output.clone());
+        dependency.timestamp_file = Some(timestamp.clone());
         dependency.fs_status = FsStatus::Stale;
         dependency.mark_completed();
         let mut parent = Fingerprint::new();
@@ -2738,13 +2782,24 @@ mod execution_tests {
             fingerprint: Arc::new(dependency),
         });
         let snapshot = parent.execution_snapshot().unwrap();
-        assert!(snapshot.deps[0].fingerprint.fs_status.up_to_date());
+        assert!(matches!(
+            snapshot.deps[0].fingerprint.fs_status,
+            FsStatus::UpToDate { mtime: Some(_) }
+        ));
         assert!(
             snapshot.deps[0]
                 .fingerprint
                 .completed
                 .load(Ordering::Acquire)
         );
+        fs::remove_file(&timestamp).unwrap();
+        assert!(
+            !parent.execution_snapshot().unwrap().deps[0]
+                .fingerprint
+                .fs_status
+                .up_to_date()
+        );
+        fs::write(&timestamp, "").unwrap();
         fs::remove_file(&output).unwrap();
         assert!(
             !parent.execution_snapshot().unwrap().deps[0]
@@ -2752,6 +2807,40 @@ mod execution_tests {
                 .fs_status
                 .up_to_date()
         );
+    }
+
+    #[test]
+    fn rmeta_edge_does_not_need_the_other_outputs_of_the_dependency() {
+        let dir = tempfile::tempdir().unwrap();
+        let rmeta = dir.path().join("libdep.rmeta");
+        let rlib = dir.path().join("libdep.rlib");
+        let timestamp = dir.path().join("dep.timestamp");
+        fs::write(&rmeta, "metadata").unwrap();
+        fs::write(&timestamp, "").unwrap();
+        let mut dependency = Fingerprint::new();
+        dependency.outputs = vec![rmeta, rlib.clone()];
+        dependency.timestamp_file = Some(timestamp);
+        let dependency = Arc::new(dependency);
+        let edge = |only_requires_rmeta| {
+            let mut parent = Fingerprint::new();
+            parent.deps.push(DepFingerprint {
+                pkg_id: 0,
+                name: "dep".into(),
+                public: false,
+                only_requires_rmeta,
+                fingerprint: dependency.clone(),
+            });
+            parent.execution_snapshot().unwrap().deps[0]
+                .fingerprint
+                .fs_status
+                .up_to_date()
+        };
+        // The rlib is still being written: only a full edge needs it.
+        assert!(edge(true));
+        assert!(!edge(false));
+        fs::write(rlib, "library").unwrap();
+        assert!(edge(true));
+        assert!(edge(false));
     }
 
     #[test]

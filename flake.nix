@@ -43,15 +43,14 @@
           lib = pkgs.lib;
           isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
 
-          # Rust 1.99.0, the toolchain the fork targets (rust-version 1.99).
+          # Rust 1.100.0, the toolchain the fork targets (rust-version 1.100).
           # The hash is that of the channel manifest, so the compiler cannot
-          # change under the same lock. It is the manifest of evorch's
-          # toolchain file, which names the same channel. The driver of every
-          # build here is this upstream cargo, never the fork itself.
+          # change under the same lock. The driver of every build here is this
+          # upstream cargo, never the fork itself.
           rustToolchain =
             (fenix.packages.${system}.toolchainOf {
-              channel = "1.99.0";
-              sha256 = "sha256-zm3dyIY2T414ZRR3EhLOvptzG6gta4WZUcawzMUWtqI=";
+              channel = "1.100.0";
+              sha256 = "sha256-MFHoWVcPZKjFrLnQnodCXbUsfZcofGfo9tV9fTTvklg=";
             }).minimalToolchain;
           craneLib = (crane.mkLib pkgs).overrideToolchain (_p: rustToolchain);
 

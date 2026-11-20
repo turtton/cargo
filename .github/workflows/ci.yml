@@ -27,7 +27,7 @@ defaults:
 
 env:
   # The compiler the fork targets; the Nix package pins the same version.
-  RUST_TOOLCHAIN: 1.99.0
+  RUST_TOOLCHAIN: 1.100.0
   CARGO_INCREMENTAL: 0
   CARGO_TERM_COLOR: always
 

@@ -807,7 +807,7 @@ fn includes() {
     fs::write(
         sub_folder.join("config.toml"),
         "
-        include = ['other.toml']
+        include = ['other.toml', 'other2.toml']
         [build]
         rustflags = [\"--flag-directory\"]
         ",
@@ -816,8 +816,25 @@ fn includes() {
     fs::write(
         sub_folder.join("other.toml"),
         "
+        include = ['nested.toml']
         [build]
         rustflags = [\"--flag-other\"]
+        ",
+    )
+    .unwrap();
+    fs::write(
+        sub_folder.join("nested.toml"),
+        "
+        [build]
+        rustflags = [\"--flag-nested\"]
+        ",
+    )
+    .unwrap();
+    fs::write(
+        sub_folder.join("other2.toml"),
+        "
+        [build]
+        rustflags = [\"--flag-other2\"]
         ",
     )
     .unwrap();
@@ -826,7 +843,7 @@ fn includes() {
         .cwd(&sub_folder.parent().unwrap())
         .masquerade_as_nightly_cargo(&["cargo-config"])
         .with_stdout_data(str![[r#"
-build.rustflags = ["--flag-global", "--flag-other", "--flag-directory"]
+build.rustflags = ["--flag-global", "--flag-nested", "--flag-other", "--flag-other2", "--flag-directory"]
 
 "#]])
         .with_stderr_data(str![[r#""#]])
@@ -838,9 +855,30 @@ build.rustflags = ["--flag-global", "--flag-other", "--flag-directory"]
         .with_stdout_data(str![[r#"
 build.rustflags = [
     "--flag-global", # [ROOT]/home/.cargo/config.toml
+    "--flag-nested", # [ROOT]/foo/.cargo/nested.toml
     "--flag-other", # [ROOT]/foo/.cargo/other.toml
+    "--flag-other2", # [ROOT]/foo/.cargo/other2.toml
     "--flag-directory", # [ROOT]/foo/.cargo/config.toml
 ]
+
+"#]])
+        .with_stderr_data(str![[r#""#]])
+        .run();
+
+    // This ensure `include` is removed and don't show up in the merged config view.
+    cargo_process("config get -Zunstable-options")
+        .cwd(&sub_folder.parent().unwrap())
+        .masquerade_as_nightly_cargo(&["cargo-config"])
+        .with_stdout_data(str![[r#"
+alias.foo = "abc --xyz"
+build.jobs = 99
+build.rustflags = ["--flag-global", "--flag-nested", "--flag-other", "--flag-other2", "--flag-directory"]
+extra-table.somekey = "somevalue"
+profile.dev.opt-level = 3
+profile.dev.package.foo.opt-level = 1
+target.'cfg(target_os = "linux")'.runner = "runme"
+# The following environment variables may affect the loaded values.
+# CARGO_HOME=[ROOT]/home/.cargo
 
 "#]])
         .with_stderr_data(str![[r#""#]])
@@ -854,12 +892,19 @@ build.rustflags = [
 # CARGO=[..]
 # CARGO_HOME=[ROOT]/home/.cargo
 
-# [ROOT]/foo/.cargo/other.toml
-build.rustflags = ["--flag-other"]
-
 # [ROOT]/foo/.cargo/config.toml
 build.rustflags = ["--flag-directory"]
-include = ["other.toml"]
+include = ["other.toml", "other2.toml"]
+
+# [ROOT]/foo/.cargo/other2.toml
+build.rustflags = ["--flag-other2"]
+
+# [ROOT]/foo/.cargo/other.toml
+build.rustflags = ["--flag-other"]
+include = ["nested.toml"]
+
+# [ROOT]/foo/.cargo/nested.toml
+build.rustflags = ["--flag-nested"]
 
 # [ROOT]/home/.cargo/config.toml
 alias.foo = "abc --xyz"
@@ -872,6 +917,44 @@ target.'cfg(target_os = "linux")'.runner = "runme"
 
 
 "##]])
+        .with_stderr_data(str![[r#""#]])
+        .run();
+}
+
+#[cargo_test]
+fn includes_same_file_twice_from_hierarchy() {
+    write_config_at(
+        paths::root().join("foo/.cargo/config.toml"),
+        "include = ['../../shared.toml']",
+    );
+    write_config_at(
+        paths::root().join(".cargo/config.toml"),
+        "include = ['../shared.toml']",
+    );
+    write_config_at(paths::root().join("shared.toml"), "key = 1");
+
+    cargo_process("config get key -Zunstable-options")
+        .cwd(paths::root().join("foo"))
+        .masquerade_as_nightly_cargo(&["cargo-config"])
+        .with_stdout_data(str![[r#"
+key = 1
+
+"#]])
+        .with_stderr_data(str![[r#""#]])
+        .run();
+
+    cargo_process("config get key --merged=no -Zunstable-options")
+        .cwd(paths::root().join("foo"))
+        .masquerade_as_nightly_cargo(&["cargo-config"])
+        .with_stdout_data(str![[r#"
+# [ROOT]/shared.toml
+key = 1
+
+# [ROOT]/shared.toml
+key = 1
+
+
+"#]])
         .with_stderr_data(str![[r#""#]])
         .run();
 }

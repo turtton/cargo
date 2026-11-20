@@ -173,6 +173,32 @@ impl Controller {
         }
     }
 
+    fn until_any(&mut self, pid: u32, phases: &[&str], package: &str, mode: &str) -> Event {
+        loop {
+            assert!(
+                !self.exits.contains_key(&pid),
+                "process {pid} exited before {phases:?}: {:?}",
+                self.exits.get(&pid).map(|e| (&e.stderr, &self.history))
+            );
+            match self.rx.recv().unwrap() {
+                Notice::Event(event) => {
+                    self.history.push(event.data.clone());
+                    if event.data["pid"] == pid
+                        && phases.contains(&event.text("phase"))
+                        && (package.is_empty() || event.text("package") == package)
+                        && (mode.is_empty() || event.text("mode") == mode)
+                    {
+                        return event;
+                    }
+                    event.resume(0);
+                }
+                Notice::Exit(pid, exit) => {
+                    self.exits.insert(pid, exit);
+                }
+            }
+        }
+    }
+
     fn wait(&mut self, pid: u32) -> Exit {
         self.wait_with_reader_elapsed(pid, 0)
     }
@@ -2042,4 +2068,106 @@ fn legacy_probe_enumerates_files_added_after_planning() {
             .iter()
             .any(|e| e["phase"] == "SharedValidated" && e["mode"] == "run-build-script")
     );
+}
+// Cargo starts a dependent as soon as the dependency's metadata is ready, so
+// the dependent may be fully built, and verified under its gate, while the
+// dependency's rlib does not exist yet. Real rustc cannot be stopped between
+// the two, so the wrapper emits the metadata first and holds the code
+// generation until the test opens the fifo.
+const GATED_RUSTC: &str = r#"#!/usr/bin/env bash
+rustc=$1; shift
+gated=0
+for arg in "$@"; do [[ $arg == probe ]] && gated=1; done
+if [[ $gated == 0 ]]; then exec "$rustc" "$@"; fi
+metadata=(); full=()
+for arg in "$@"; do
+  case $arg in
+    --emit=*) metadata+=(--emit=dep-info,metadata); full+=("$arg");;
+    --json=*) metadata+=("$arg"); full+=("${arg/,artifacts/}");;
+    *) metadata+=("$arg"); full+=("$arg");;
+  esac
+done
+"$rustc" "${metadata[@]}" || exit $?
+read -r _ < "$GATE"
+exec "$rustc" "${full[@]}"
+"#;
+
+#[cargo_test]
+fn pipelined_dependent_is_verified_while_the_dependency_rlib_is_missing() {
+    let mut controller = Controller::new();
+    let p = writer_fixture(false, &paths::root().join("shared-build"));
+    fs::write(
+        p.root().join("Cargo.toml"),
+        "[package]\nname='consumer'\nversion='0.1.0'\nedition='2024'\n[dependencies]\nmiddle={path='middle'}\n[workspace]\n",
+    )
+    .unwrap();
+    fs::create_dir_all(p.root().join("middle/src")).unwrap();
+    fs::write(
+        p.root().join("middle/Cargo.toml"),
+        "[package]\nname='middle'\nversion='0.1.0'\nedition='2024'\n[dependencies]\nprobe={path='../probe'}\n",
+    )
+    .unwrap();
+    // Only a type crosses the edge: the metadata of the dependency, which has no
+    // MIR when rustc is stopped after emitting it, is enough to build `middle`.
+    fs::write(p.root().join("probe/src/lib.rs"), "pub struct Token;").unwrap();
+    fs::write(
+        p.root().join("middle/src/lib.rs"),
+        "pub fn value() -> u32 { let _: Option<probe::Token> = None; 11 }",
+    )
+    .unwrap();
+    fs::write(
+        p.root().join("src/main.rs"),
+        "fn main() { println!(\"{}\", middle::value()); }",
+    )
+    .unwrap();
+    let wrapper = controller.dir.path().join("gated-rustc");
+    let gate = controller.dir.path().join("gate");
+    fs::write(&wrapper, GATED_RUSTC).unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    let fifo = std::ffi::CString::new(gate.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let mut command = p
+        .cargo("build -j3 -p middle")
+        .arg("-Zfine-grain-locking")
+        .arg("--target-dir")
+        .arg("target-one")
+        .masquerade_as_nightly_cargo(&["fine grain locking"])
+        .env("INV_MODE", "A")
+        .env("RUSTC_WRAPPER", &wrapper)
+        .env("GATE", &gate)
+        .build_command();
+    command.env("CARGO_BUILD_GC_FREQUENCY", "never");
+    let build = controller.spawn(command);
+    let pid = build.pid;
+    let metadata = controller.until(pid, "MetadataProduced", "probe", "compile");
+    let unit_dir = metadata.lock().parent().unwrap().to_path_buf();
+    metadata.resume(0);
+    // The dependent finishes verification, or fails it, while the gate is shut.
+    let verified = controller.until_any(
+        pid,
+        &["SharedValidated", "FatalConflict"],
+        "middle",
+        "compile",
+    );
+    let phase = verified.text("phase").to_owned();
+    let rlib_exists = walkdir::WalkDir::new(&unit_dir)
+        .into_iter()
+        .map(Result::unwrap)
+        .any(|e| e.path().extension().is_some_and(|ext| ext == "rlib"));
+    verified.resume(0);
+    // Release the code generation before any assertion so a failure here
+    // cannot leave the dependency blocked.
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&gate)
+        .unwrap()
+        .write_all(b"go\n")
+        .unwrap();
+    let exit = build.wait(&mut controller);
+    assert!(
+        !rlib_exists,
+        "the dependency rlib was written before the gate opened"
+    );
+    assert_eq!(phase, "SharedValidated", "{exit:?}");
+    success(exit);
 }

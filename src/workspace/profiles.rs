@@ -160,6 +160,7 @@ impl Profiles {
                 "debug",
                 TomlProfile {
                     inherits: Some(String::from("dev")),
+                    debug: Some(TomlDebugInfo::Full),
                     ..TomlProfile::default()
                 },
             ),
@@ -843,7 +844,7 @@ impl Profile {
         Profile {
             name: "dev".into(),
             root: ProfileRoot::Debug,
-            debuginfo: DebugInfo::Resolved(TomlDebugInfo::Full),
+            debuginfo: DebugInfo::Resolved(TomlDebugInfo::LineTablesOnly),
             debug_assertions: true,
             overflow_checks: true,
             incremental: true,
@@ -1478,7 +1479,7 @@ fn warn_ignored_hint_mostly_unused(
     if gctx.cli_unstable().profile_hint_mostly_unused {
         return Ok(());
     }
-    let mut key = context::ConfigKey::from_str("profile");
+    let mut key = context::ConfigKey::from_parts(["profile"]);
     key.push(name);
     let mut tables = vec![(&profile.val, key.clone())];
     if let Some(build_override) = &profile.val.build_override {
