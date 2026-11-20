@@ -3,15 +3,14 @@
 //! This module contains types that define the schema for various configuration
 //! sections found in Cargo configuration.
 //!
-//! These types are mostly used by [`GlobalContext::get`](super::GlobalContext::get)
+//! These types are mostly used by [`ConfigReader::get`](super::ConfigReader::get)
 //! to deserialize configuration values from TOML files, environment variables,
 //! and CLI arguments.
 //!
 //! Schema types here should only contain data and simple accessor methods.
-//! Avoid depending on [`GlobalContext`](super::GlobalContext) directly.
+//! Avoid depending on Cargo's `GlobalContext` directly.
 
-use crate::sources::CRATES_IO_REGISTRY;
-use crate::util::data_structures::HashMap;
+use cargo_util::collections::HashMap;
 use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::str::FromStr;
@@ -22,18 +21,45 @@ use cargo_util_schemas::manifest::ProfileName;
 use serde::Deserialize;
 use serde::Serialize;
 use serde::de;
+use serde::de::Error;
 use serde_untagged::UntaggedEnumVisitor;
 
 use std::path::Path;
 
-use crate::CargoResult;
+use anyhow::Result;
 
+use super::CRATES_IO_REGISTRY;
 use super::OptValue;
-use super::PathAndArgs;
-use super::StringList;
 use super::Value;
-use super::path::ConfigRelativePath;
 
+/// Cargo's `.cargo/config.toml` file
+#[cfg(feature = "unstable-schema")]
+#[derive(schemars::JsonSchema)]
+pub struct Config {
+    pub build: Option<CargoBuildConfig>,
+    pub cache: Option<CargoCacheConfig>,
+    pub cargo_new: Option<CargoNewConfig>,
+    pub doc: Option<DocConfig>,
+    pub env: Option<EnvConfig>,
+    pub future_incompat_report: Option<CargoFutureIncompatConfig>,
+    pub http: Option<CargoHttpConfig>,
+    pub net: Option<CargoNetConfig>,
+    pub registries: Option<HashMap<String, RegistryConfig>>,
+    pub registry: Option<GlobalRegistryConfig>,
+    pub resolver: Option<CargoResolverConfig>,
+    pub source: Option<HashMap<String, SourceConfigDef>>,
+    pub term: Option<TermConfig>,
+}
+
+/// Cargo's `credentials.toml` file
+#[cfg(feature = "unstable-schema")]
+#[derive(schemars::JsonSchema)]
+pub struct Credentials {
+    pub registry: Option<RegistryCredential>,
+    pub registries: Option<HashMap<String, RegistryCredential>>,
+}
+
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub struct CargoCacheConfig {
@@ -49,6 +75,7 @@ pub struct CargoCacheConfig {
 /// low-level details, and may not be something typical users need.
 ///
 /// If any of these options are `None`, the built-in default is used.
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub struct GlobalCleanConfig {
@@ -64,6 +91,7 @@ pub struct GlobalCleanConfig {
     pub max_git_db_age: Option<String>,
 }
 
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct CargoNewConfig {
@@ -79,6 +107,7 @@ pub struct CargoNewConfig {
     pub version_control: Option<VersionControl>,
 }
 
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum VersionControl {
     Git,
@@ -128,6 +157,7 @@ impl<'de> de::Deserialize<'de> for VersionControl {
 }
 
 /// Definition of a source in a config file.
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct SourceConfigDef {
@@ -149,10 +179,18 @@ pub struct SourceConfigDef {
     pub rev: OptValue<String>,
 }
 
+#[cfg(feature = "unstable-schema")]
+#[derive(schemars::JsonSchema)]
+pub struct DocConfig {
+    pub browser: Option<PathAndArgs>,
+    pub extern_map: Option<RustdocExternMap>,
+}
+
 /// A map of registry names to URLs where documentations are hosted.
 /// This is for unstable feature [`-Zrustdoc-map`][1].
 ///
 /// [1]: https://doc.rust-lang.org/nightly/cargo/reference/unstable.html#rustdoc-map
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(serde::Deserialize, Debug)]
 #[serde(default)]
 pub struct RustdocExternMap {
@@ -199,6 +237,7 @@ impl hash::Hash for RustdocExternMap {
 /// Mode used for `std`. This is for unstable feature [`-Zrustdoc-map`][1].
 ///
 /// [1]: https://doc.rust-lang.org/nightly/cargo/reference/unstable.html#rustdoc-map
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Hash)]
 pub enum RustdocExternMode {
     /// Use a local `file://` URL.
@@ -252,6 +291,7 @@ impl<'de> serde::de::Deserialize<'de> for RustdocExternMode {
 /// multiplexing = true
 /// ssl-version = "tlsv1.3"
 /// ```
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub struct CargoHttpConfig {
@@ -275,12 +315,14 @@ pub struct CargoHttpConfig {
 /// [future-incompat-report]
 /// frequency = "always"
 /// ```
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub struct CargoFutureIncompatConfig {
     frequency: Option<CargoFutureIncompatFrequencyConfig>,
 }
 
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum CargoFutureIncompatFrequencyConfig {
@@ -314,6 +356,7 @@ impl CargoFutureIncompatConfig {
 /// ssl-version.min = "tlsv1.2"
 /// ssl-version.max = "tlsv1.3"
 /// ```
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, PartialEq)]
 pub enum SslVersionConfig {
     Single(String),
@@ -325,13 +368,34 @@ impl<'de> Deserialize<'de> for SslVersionConfig {
     where
         D: serde::Deserializer<'de>,
     {
-        UntaggedEnumVisitor::new()
-            .string(|single| Ok(SslVersionConfig::Single(single.to_owned())))
-            .map(|map| map.deserialize().map(SslVersionConfig::Range))
-            .deserialize(deserializer)
+        struct Visitor;
+
+        impl<'de> de::Visitor<'de> for Visitor {
+            type Value = SslVersionConfig;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a string or map")
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(SslVersionConfig::Single(value.to_owned()))
+            }
+
+            fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+                Ok(SslVersionConfig::Single(value))
+            }
+
+            fn visit_map<M: de::MapAccess<'de>>(self, map: M) -> Result<Self::Value, M::Error> {
+                SslVersionConfigRange::deserialize(de::value::MapAccessDeserializer::new(map))
+                    .map(SslVersionConfig::Range)
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
     }
 }
 
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub struct SslVersionConfigRange {
@@ -349,6 +413,7 @@ pub struct SslVersionConfigRange {
 /// offline = false
 /// git-fetch-with-cli = true
 /// ```
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct CargoNetConfig {
@@ -358,6 +423,7 @@ pub struct CargoNetConfig {
     pub ssh: Option<CargoSshConfig>,
 }
 
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct CargoSshConfig {
@@ -376,6 +442,7 @@ pub struct CargoSshConfig {
 /// [build]
 /// jobs = "default" # Currently only support "default".
 /// ```
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone)]
 pub enum JobsConfig {
     Integer(i32),
@@ -406,6 +473,7 @@ impl<'de> Deserialize<'de> for JobsConfig {
 /// rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 /// incremental = true
 /// ```
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct CargoBuildConfig {
@@ -446,6 +514,7 @@ pub struct CargoBuildConfig {
 /// max-size = "auto" # twice the largest build of the last max-unused
 /// frequency = "1 hour"
 /// ```
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct BuildDirGcConfig {
@@ -465,11 +534,18 @@ pub struct BuildDirGcConfig {
     /// dependencies (`{cargo-cache-home}/targets/shared-deps`). Defaults to
     /// 50 GiB; `"none"` disables it.
     pub shared_max_size: Option<String>,
+    /// Size limit of the build-dirs of all other projects together in
+    /// `{cargo-cache-home}/targets/`: the least recently built ones are
+    /// removed whole until they fit, except those built within 6 hours.
+    /// While the disk has less than 5% free (at most 20 GiB), they go
+    /// whatever their age. Defaults to 50 GiB; `"none"` disables both.
+    pub projects_max_size: Option<String>,
     /// How often to scan the build-dir: `"always"`, `"never"`, or a span.
     pub frequency: Option<String>,
 }
 
 /// Metrics collection for build analysis.
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct CargoBuildAnalysis {
@@ -477,6 +553,7 @@ pub struct CargoBuildAnalysis {
 }
 
 /// Whether warnings should warn, be allowed, or cause an error.
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum WarningHandling {
@@ -489,6 +566,7 @@ pub enum WarningHandling {
     Deny,
 }
 
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Deserialize, Serialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum FingerprintMethod {
@@ -513,6 +591,7 @@ impl std::fmt::Display for FingerprintMethod {
 }
 
 /// Configuration for `build.build-std`.
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct BuildStdConfig {
@@ -521,6 +600,7 @@ pub struct BuildStdConfig {
 }
 
 /// When to build the standard library.
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum BuildStdWhen {
@@ -530,6 +610,7 @@ pub enum BuildStdWhen {
 
 /// Which standard library crates to build.
 /// Valid values are "core", "alloc", "std", or an array of crate names
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, PartialEq, Eq)]
 pub enum BuildStdCrates {
     Core,
@@ -568,12 +649,14 @@ impl<'de> Deserialize<'de> for BuildStdCrates {
 /// target = ["a"]
 /// target = ["a", "b"]
 /// ```
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Deserialize)]
 #[serde(transparent)]
 pub struct BuildTargetConfig {
     inner: Value<BuildTargetConfigInner>,
 }
 
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(Debug)]
 enum BuildTargetConfigInner {
     One(String),
@@ -594,7 +677,7 @@ impl<'de> Deserialize<'de> for BuildTargetConfigInner {
 
 impl BuildTargetConfig {
     /// Gets values of `build.target` as a list of strings.
-    pub fn values(&self, cwd: &Path) -> CargoResult<Vec<String>> {
+    pub fn values(&self, cwd: &Path) -> Result<Vec<String>> {
         let map = |s: &String| {
             if s.ends_with(".json") {
                 // Path to a target specification file (in JSON).
@@ -630,6 +713,7 @@ impl BuildTargetConfig {
 /// feature-unification = "workspace"
 /// lockfile-path = "my/Cargo.lock"
 /// ```
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct CargoResolverConfig {
@@ -639,6 +723,7 @@ pub struct CargoResolverConfig {
     pub lockfile_path: Option<ConfigRelativePath>,
 }
 
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum IncompatibleRustVersions {
@@ -646,6 +731,7 @@ pub enum IncompatibleRustVersions {
     Fallback,
 }
 
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum IncompatiblePublishAge {
@@ -653,6 +739,7 @@ pub enum IncompatiblePublishAge {
     Deny,
 }
 
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(Copy, Clone, Debug, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FeatureUnification {
@@ -672,6 +759,7 @@ pub enum FeatureUnification {
 /// color = "auto"
 /// progress.when = "auto"
 /// ```
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct TermConfig {
@@ -697,6 +785,7 @@ pub struct TermConfig {
 /// [term]
 /// progress = { when = "always", width = 80 }
 /// ```
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Default)]
 pub struct ProgressConfig {
     pub when: ProgressWhen,
@@ -705,6 +794,7 @@ pub struct ProgressConfig {
     pub term_integration: Option<bool>,
 }
 
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProgressWhen {
@@ -749,6 +839,7 @@ impl<'de> Deserialize<'de> for ProgressConfig {
     }
 }
 
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(Debug)]
 enum EnvConfigValueInner {
     Simple(String),
@@ -773,17 +864,34 @@ impl<'de> Deserialize<'de> for EnvConfigValueInner {
             relative: bool,
         }
 
-        UntaggedEnumVisitor::new()
-            .string(|simple| Ok(EnvConfigValueInner::Simple(simple.to_owned())))
-            .map(|map| {
-                let with_options: WithOptions = map.deserialize()?;
+        struct Visitor;
+
+        impl<'de> de::Visitor<'de> for Visitor {
+            type Value = EnvConfigValueInner;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a string or map")
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(EnvConfigValueInner::Simple(value.to_owned()))
+            }
+
+            fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+                Ok(EnvConfigValueInner::Simple(value))
+            }
+
+            fn visit_map<M: de::MapAccess<'de>>(self, map: M) -> Result<Self::Value, M::Error> {
+                let options = WithOptions::deserialize(de::value::MapAccessDeserializer::new(map))?;
                 Ok(EnvConfigValueInner::WithOptions {
-                    value: with_options.value,
-                    force: with_options.force,
-                    relative: with_options.relative,
+                    value: options.value,
+                    force: options.force,
+                    relative: options.relative,
                 })
-            })
-            .deserialize(deserializer)
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
     }
 }
 
@@ -801,6 +909,7 @@ impl<'de> Deserialize<'de> for EnvConfigValueInner {
 /// BAR = { value = "relative/path", relative = true }
 /// BAZ = { value = "override", force = true }
 /// ```
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Deserialize)]
 #[serde(transparent)]
 pub struct EnvConfigValue {
@@ -842,20 +951,24 @@ impl EnvConfigValue {
 pub type EnvConfig = HashMap<String, EnvConfigValue>;
 
 /// Credentials for a registry.
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct RegistryCredential {
+    #[cfg_attr(feature = "unstable-schema", schemars(with = "Option<String>"))]
     pub token: OptValue<Secret<String>>,
 }
 
 /// `[registries.NAME]` tables.
 ///
 /// The values here should be kept in sync with `GlobalRegistryConfig`
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(Deserialize, Clone, Debug)]
 #[serde(rename_all = "kebab-case")]
 pub struct RegistryConfig {
     pub index: Option<String>,
     #[deprecated = "see `RegistryCredential::token` instead"]
+    #[cfg_attr(feature = "unstable-schema", schemars(with = "Option<String>"))]
     pub token: OptValue<Secret<String>>,
     pub credential_provider: Option<PathAndArgs>,
     /// Minimum publish age threshold for RFC 3923
@@ -868,11 +981,13 @@ pub struct RegistryConfig {
 ///
 /// Note: nesting `RegistryConfig` inside this struct and using `serde(flatten)` *should* work
 /// but fails with "invalid type: sequence, expected a value" when attempting to deserialize.
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct GlobalRegistryConfig {
     pub index: Option<String>,
     #[deprecated = "see `RegistryCredential::token` instead"]
+    #[cfg_attr(feature = "unstable-schema", schemars(with = "Option<String>"))]
     pub token: OptValue<Secret<String>>,
     pub credential_provider: Option<PathAndArgs>,
     /// Global default Minimum publish age threshold for RFC 3923
@@ -897,9 +1012,138 @@ impl GlobalRegistryConfig {
     }
 }
 
+/// Use with the `get` API to fetch a string that will be converted to a
+/// `PathBuf`. Relative paths are converted to absolute paths based on the
+/// location of the config file.
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Deserialize, PartialEq, Clone)]
+#[serde(transparent)]
+pub struct ConfigRelativePath(Value<String>);
+
+impl ConfigRelativePath {
+    pub fn new(path: Value<String>) -> ConfigRelativePath {
+        ConfigRelativePath(path)
+    }
+
+    /// Returns the underlying value.
+    pub fn value(&self) -> &Value<String> {
+        &self.0
+    }
+
+    /// Returns the raw underlying configuration value for this key.
+    pub fn raw_value(&self) -> &str {
+        &self.0.val
+    }
+}
+
+/// A config type that is a program to run.
+///
+/// This supports a list of strings like `['/path/to/program', 'somearg']`
+/// or a space separated string like `'/path/to/program somearg'`.
+///
+/// This expects the first value to be the path to the program to run.
+/// Subsequent values are strings of arguments to pass to the program.
+///
+/// Typically you should use `ConfigRelativePathResolveExt::resolve_program` on the path
+/// to get the actual program.
+///
+/// **Note**: Any usage of this type in config needs to be listed in
+/// the `NON_MERGEABLE_LISTS` check to prevent list merging
+/// from multiple config files.
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, PartialEq)]
+pub struct PathAndArgs {
+    pub path: ConfigRelativePath,
+    pub args: Vec<String>,
+}
+
+impl<'de> serde::Deserialize<'de> for PathAndArgs {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let vsl = Value::<StringList>::deserialize(deserializer)?;
+        let mut strings = vsl.val.0;
+        if strings.is_empty() {
+            return Err(D::Error::invalid_length(0, &"at least one element"));
+        }
+        let first = strings.remove(0);
+        let crp = Value {
+            val: first,
+            definition: vsl.definition,
+        };
+        Ok(PathAndArgs {
+            path: ConfigRelativePath(crp),
+            args: strings,
+        })
+    }
+}
+
+impl PathAndArgs {
+    /// Construct a `PathAndArgs` from a string. The string will be split on ascii whitespace,
+    /// with the first item being treated as a `ConfigRelativePath` to the executable, and subsequent
+    /// items as arguments.
+    pub fn from_whitespace_separated_string(p: &Value<String>) -> PathAndArgs {
+        let mut iter = p.val.split_ascii_whitespace().map(str::to_string);
+        let val = iter.next().unwrap_or_default();
+        let args = iter.collect();
+        let crp = Value {
+            val,
+            definition: p.definition.clone(),
+        };
+        PathAndArgs {
+            path: ConfigRelativePath(crp),
+            args,
+        }
+    }
+}
+
+/// A type to deserialize a list of strings from a toml file.
+///
+/// Supports deserializing either a whitespace-separated list of arguments in a
+/// single string or a string list itself. For example these deserialize to
+/// equivalent values:
+///
+/// ```toml
+/// a = 'a b c'
+/// b = ['a', 'b', 'c']
+/// ```
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Deserialize, Clone)]
+pub struct StringList(Vec<String>);
+
+impl StringList {
+    pub fn as_slice(&self) -> &[String] {
+        &self.0
+    }
+}
+
+#[cfg(feature = "unstable-schema")]
+#[test]
+fn dump_config_schema() {
+    let schema = schemars::schema_for!(Config);
+    let dump = serde_json::to_string_pretty(&schema).unwrap();
+    snapbox::assert_data_eq!(dump, snapbox::file!("../config.schema.json").raw());
+}
+
+#[cfg(feature = "unstable-schema")]
+#[test]
+fn dump_credentials_schema() {
+    let schema = schemars::schema_for!(Credentials);
+    let dump = serde_json::to_string_pretty(&schema).unwrap();
+    snapbox::assert_data_eq!(dump, snapbox::file!("../credentials.schema.json").raw());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::hash::{DefaultHasher, Hash as _, Hasher as _};
+
+    fn hash_u64(value: &RustdocExternMap) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
 
     #[test]
     fn extern_map_hash_ignores_registry_insertion_order() {
@@ -912,9 +1156,6 @@ mod tests {
         };
         let forward = map(entries.iter().cloned().collect());
         let reverse = map(entries.into_iter().rev().collect());
-        assert_eq!(
-            crate::util::hash_u64(&forward),
-            crate::util::hash_u64(&reverse)
-        );
+        assert_eq!(hash_u64(&forward), hash_u64(&reverse));
     }
 }

@@ -630,8 +630,6 @@ fn verify_mix_cargo_feature_z() {
     p.cargo("check --message-format=short")
         .arg("-Zpublic-dependency")
         .masquerade_as_nightly_cargo(&["public-dependency"])
-        // The order rustc reports these two lints in depends on the paths of
-        // the environment, so it must not be asserted.
         .with_stderr_data(
             str![[r#"
 ...
