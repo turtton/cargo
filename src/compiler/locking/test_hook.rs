@@ -3,6 +3,7 @@
 
 use crate::CargoResult;
 use crate::compiler::{BuildRunner, Unit};
+use crate::util::GlobalContext;
 use std::path::Path;
 use std::time::Duration;
 
@@ -47,6 +48,30 @@ impl TestHook {
         #[cfg(not(all(unix, debug_assertions)))]
         {
             let _ = (build_runner, unit, path);
+            Self::default()
+        }
+    }
+
+    /// Layout/GC have no build unit; report their paths through the same barrier.
+    pub fn for_path(gctx: &GlobalContext, path: &Path, mode: &'static str) -> Self {
+        #[cfg(all(unix, debug_assertions))]
+        {
+            let data = gctx
+                .get_env_os("__CARGO_TEST_UNIT_LOCK_SOCKET")
+                .map(|socket| {
+                    std::sync::Arc::new(Data {
+                        socket: socket.into(),
+                        path: path.into(),
+                        package: String::new(),
+                        target: String::new(),
+                        mode,
+                    })
+                });
+            Self { data }
+        }
+        #[cfg(not(all(unix, debug_assertions)))]
+        {
+            let _ = (gctx, path, mode);
             Self::default()
         }
     }

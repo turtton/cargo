@@ -634,6 +634,7 @@ fn assert_all_clean(build_dir: &Path) {
         | ".cargo-lock"
         | ".cargo-build-lock"
         | ".cargo-artifact-lock"
+        | ".cargo-project-gc-lock"
         | "CACHEDIR.TAG" = path.file_name().unwrap().to_str().unwrap()
         {
             continue;

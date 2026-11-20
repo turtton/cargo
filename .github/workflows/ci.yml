@@ -98,6 +98,13 @@ jobs:
             build_script:: \
             build_script_env:: \
             build_scripts_multiple::
+      # Exact names avoid also selecting the unrelated cargo_clean CLI help
+      # snapshots through libtest's substring filters.
+      - name: Package clean retains project coordination
+        run: |
+          cargo test --locked -p cargo --test testsuite -- --exact \
+            clean::package_cleans_all_the_things \
+            clean_legacy_layout::package_cleans_all_the_things
 
   # The same focused tests on macOS (macos-15, arm64), with the upstream cargo
   # that rustup installs as the driver. Informational for now: a failure is
@@ -137,3 +144,8 @@ jobs:
             build_script:: \
             build_script_env:: \
             build_scripts_multiple::
+      - name: Package clean retains project coordination
+        run: |
+          cargo test --locked -p cargo --test testsuite -- --exact \
+            clean::package_cleans_all_the_things \
+            clean_legacy_layout::package_cleans_all_the_things

@@ -728,6 +728,270 @@ fn fork_command(p: &Project, cwd: &Path, home: &Path, args: &str, mode: &str) ->
         .build_command()
 }
 
+fn out_link_collector(p: &Project, cwd: &Path, home: &Path) -> Command {
+    let mut command = fork_command(p, cwd, home, "build -p gc-driver", "GC");
+    command.env("CARGO_BUILD_GC_FREQUENCY", "always");
+    command
+}
+
+// Age fixture data, not an elapsed-time deadline: every candidate is older than
+// the default idle-project retention period before either process starts.
+fn idle_project_fixture(controller: &mut Controller) -> (Project, Project, PathBuf, PathBuf) {
+    let victim = project()
+        .at("victim")
+        .file(
+            "Cargo.toml",
+            "[package]\nname='victim'\nversion='0.1.0'\nedition='2024'\n",
+        )
+        .file("src/lib.rs", "pub fn value() -> u32 { 1 }")
+        .build();
+    let collector = project()
+        .at("collector")
+        .file(
+            "Cargo.toml",
+            "[package]\nname='collector'\nversion='0.1.0'\nedition='2024'\n",
+        )
+        .file("src/lib.rs", "pub fn value() -> u32 { 2 }")
+        .build();
+    let home = controller.dir.path().join("project-gc-home");
+    let mut seed = fork_command(&victim, &victim.root(), &home, "build --lib", "seed");
+    seed.env("CARGO_BUILD_GC_FREQUENCY", "never");
+    success(controller.spawn(seed).wait(controller));
+    let roots: Vec<_> = fs::read_dir(home.join("targets"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_dir())
+        .collect();
+    assert_eq!(roots.len(), 1, "{roots:?}");
+    let root = roots.into_iter().next().unwrap();
+    let old = filetime::FileTime::from_unix_time(1, 0);
+    for entry in walkdir::WalkDir::new(&root).contents_first(true) {
+        filetime::set_symlink_file_times(entry.unwrap().path(), old, old).unwrap();
+    }
+    (victim, collector, home, root)
+}
+
+#[cargo_test]
+fn idle_project_gc_preserves_a_new_profile_started_after_candidate_observation() {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut controller = Controller::new();
+    let (victim, collector, home, root) = idle_project_fixture(&mut controller);
+    let mut collect = fork_command(&collector, &collector.root(), &home, "build --lib", "GC");
+    collect
+        .env("CARGO_BUILD_GC_FREQUENCY", "always")
+        .env("CARGO_SHARED_DEPS", "1");
+    let collect = controller.spawn(collect);
+    let candidate = controller.until(collect.pid, "ProjectGcCandidate", "", "gc");
+    assert_eq!(candidate.lock(), root);
+    // The collector has observed only debug/.cargo-build-lock. A new release
+    // profile must be protected without depending on that directory snapshot.
+    let mut build = fork_command(&victim, &victim.root(), &home, "build --lib --release", "B");
+    build.env("CARGO_BUILD_GC_FREQUENCY", "never");
+    let build = controller.spawn(build);
+    let linked = controller.until(build.pid, "OutDirLinked", "victim", "compile");
+    let link = linked.lock();
+    let lock = link.with_extension("lock");
+    let inode = fs::metadata(&lock).unwrap().ino();
+    candidate.resume(0);
+    success(collect.wait(&mut controller));
+    let preserved = link.is_symlink() && lock.is_file();
+    linked.resume(0);
+    // Run actual rustc before checking preservation, retaining its real failure
+    // when a collector removes the active profile's output paths.
+    success(build.wait(&mut controller));
+    assert!(preserved, "GC removed an active new profile: {link:?}");
+    assert_eq!(fs::metadata(lock).unwrap().ino(), inode);
+}
+
+#[cargo_test]
+fn idle_project_gc_waiter_reopens_a_lock_from_a_removed_project() {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut controller = Controller::new();
+    let (victim, collector, home, root) = idle_project_fixture(&mut controller);
+    let mut collect = fork_command(&collector, &collector.root(), &home, "build --lib", "GC");
+    collect
+        .env("CARGO_BUILD_GC_FREQUENCY", "always")
+        .env("CARGO_SHARED_DEPS", "1");
+    let collect = controller.spawn(collect);
+    let removing = controller.until(collect.pid, "ProjectGcAcquired", "", "gc");
+    assert_eq!(removing.lock(), root);
+    let mut build = fork_command(&victim, &victim.root(), &home, "build --lib --release", "B");
+    build.env("CARGO_BUILD_GC_FREQUENCY", "never");
+    let build = controller.spawn(build);
+    let opened = controller.until(build.pid, "ProjectGcOpened", "", "layout");
+    let lock = opened.lock();
+    assert_eq!(lock.parent().unwrap(), root);
+    assert!(
+        !root.join("release").exists(),
+        "profile creation must follow project SH"
+    );
+    // Retain the descriptor so its inode cannot be recycled for the new root.
+    // The builder also opened this inode but has not yet tried its shared lock.
+    let old_file = File::open(&lock).unwrap();
+    let old_inode = old_file.metadata().unwrap().ino();
+    opened.resume(0);
+    removing.resume(0);
+    // No timing guess about whether the builder already blocked on SH: either
+    // way, it must reject the old descriptor and open the current path again.
+    let reopened = controller.until(build.pid, "ProjectGcOpened", "", "layout");
+    assert_eq!(reopened.lock(), lock);
+    assert_ne!(fs::metadata(&lock).unwrap().ino(), old_inode);
+    assert!(root.join("CACHEDIR.TAG").is_file());
+    assert!(!root.join("release").exists());
+    success(collect.wait(&mut controller));
+    reopened.resume(0);
+    success(build.wait(&mut controller));
+    assert!(root.join("release/.out").is_dir());
+}
+
+#[cargo_test]
+fn out_link_gc_preserves_an_active_compile_with_an_unresolvable_target() {
+    use std::os::unix::fs::MetadataExt as _;
+    let (p, _, gc) = abba_fixture();
+    let mut controller = Controller::new();
+    // GC-disabled builders must participate in the same output-link protocol.
+    for frequency in ["never", "always"] {
+        let home = controller.dir.path().join(frequency);
+        let mut command = fork_command(&p, &p.root(), &home, "build -p a", "A");
+        command.env("CARGO_BUILD_GC_FREQUENCY", frequency);
+        let builder = controller.spawn(command);
+        let linked = controller.until(builder.pid, "OutDirLinked", "a", "compile");
+        let link = linked.lock();
+        let lock = link.with_extension("lock");
+        let inode = fs::metadata(&lock).unwrap().ino();
+        observer(&lock, true);
+        let out = fs::read_link(&link).unwrap();
+        let hidden = out.with_file_name("hidden-out");
+        // Model another mount namespace: the collector cannot resolve the
+        // builder's absolute target. Keep the package/unit/lock inodes intact.
+        fs::rename(&out, &hidden).unwrap();
+        assert!(link.is_symlink() && !link.exists());
+        let collector = controller.spawn(out_link_collector(&p, &gc, &home));
+        success(collector.wait(&mut controller));
+        let preserved = link.is_symlink() && fs::metadata(&lock).is_ok_and(|m| m.ino() == inode);
+        fs::rename(&hidden, &out).unwrap();
+        linked.resume(0);
+        // On the old collector rustc fails here through its missing .out path.
+        // Do not tie this assertion to a particular rustc temp-dir diagnostic.
+        success(builder.wait(&mut controller));
+        assert!(preserved, "GC removed an active output link or its lock");
+        assert!(link.is_dir());
+        assert_eq!(fs::metadata(&lock).unwrap().ino(), inode);
+        observer(&lock, false);
+    }
+}
+
+#[cargo_test]
+fn out_link_gc_rechecks_a_candidate_after_a_builder_repoints_it() {
+    use std::os::unix::fs::symlink;
+    let (p, _, gc) = abba_fixture();
+    let mut controller = Controller::new();
+    let home = controller.dir.path().join("home");
+    let seed = controller.spawn(fork_command(&p, &p.root(), &home, "build -p a", "A"));
+    let linked = controller.until(seed.pid, "OutDirLinked", "a", "compile");
+    let link = linked.lock();
+    linked.resume(0);
+    success(seed.wait(&mut controller));
+    fs::remove_file(&link).unwrap();
+    symlink(home.join("missing"), &link).unwrap();
+    let collector = controller.spawn(out_link_collector(&p, &gc, &home));
+    let candidate = controller.until(collector.pid, "OutLinkCandidate", "", "gc");
+    assert_eq!(candidate.lock(), link);
+    // A real builder replaces the stale link after GC's observation. Let it
+    // finish so GC can acquire EX: skipping a busy lock alone cannot pass this.
+    p.change_file("a/src/lib.rs", "pub fn mode() -> &'static str { \"new\" }");
+    let builder = controller.spawn(fork_command(&p, &p.root(), &home, "build -p a", "A"));
+    success(builder.wait(&mut controller));
+    let target = fs::read_link(&link).unwrap();
+    assert!(link.is_dir());
+    candidate.resume(0);
+    success(collector.wait(&mut controller));
+    assert_eq!(fs::read_link(&link).unwrap(), target);
+    assert!(link.is_dir());
+}
+
+#[cargo_test]
+fn out_link_gc_only_removes_unused_dangling_links_and_retains_lock_inodes() {
+    use std::os::unix::fs::{MetadataExt as _, symlink};
+    let (p, _, gc) = abba_fixture();
+    let mut controller = Controller::new();
+    let home = controller.dir.path().join("home");
+    let seed = controller.spawn(fork_command(&p, &p.root(), &home, "build -p a", "A"));
+    let linked = controller.until(seed.pid, "OutDirLinked", "a", "compile");
+    let normal = linked.lock();
+    linked.resume(0);
+    success(seed.wait(&mut controller));
+    let links = normal.parent().unwrap();
+    let dangling = links.join("unused");
+    let orphan = links.join("no-lock-yet");
+    let tmp = links.join("unused.tmp123");
+    let ordinary = links.join("ordinary");
+    let unknown = links.join("unknown-target");
+    let lock_error = links.join("unopenable-lock");
+    for link in [&dangling, &orphan, &tmp, &lock_error] {
+        symlink(home.join("missing"), link).unwrap();
+    }
+    // ELOOP is not proof of a missing target.
+    symlink(&unknown, &unknown).unwrap();
+    fs::write(&ordinary, b"not a link").unwrap();
+    fs::create_dir(lock_error.with_extension("lock")).unwrap();
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dangling.with_extension("lock"))
+        .unwrap();
+    let inode = lock.metadata().unwrap().ino();
+    let collector = controller.spawn(out_link_collector(&p, &gc, &home));
+    let exit = collector.wait(&mut controller);
+    assert!(
+        exit.stderr.contains("failed to clean the build directory"),
+        "{exit:?}"
+    );
+    success(exit);
+    assert!(!dangling.is_symlink());
+    assert!(!orphan.is_symlink());
+    assert!(orphan.with_extension("lock").is_file());
+    assert_eq!(
+        fs::metadata(dangling.with_extension("lock")).unwrap().ino(),
+        inode
+    );
+    // Locking the retained descriptor still excludes an opener by pathname.
+    lock.lock().unwrap();
+    observer(&dangling.with_extension("lock"), true);
+    assert!(normal.is_dir());
+    assert!(tmp.is_symlink());
+    assert!(unknown.is_symlink());
+    assert!(lock_error.is_symlink());
+    assert_eq!(fs::read(&ordinary).unwrap(), b"not a link");
+}
+
+#[cargo_test]
+fn package_gc_protection_precedes_creation_of_new_unit_outputs() {
+    let (p, _, gc) = abba_fixture();
+    let mut controller = Controller::new();
+    let home = controller.dir.path().join("home");
+    let builder = controller.spawn(fork_command(
+        &p,
+        &p.root(),
+        &home,
+        "build -p consumer-b -j1",
+        "A",
+    ));
+    // a sorts first. On the old code b and consumer-b already have unmarked
+    // out directories but no GC protection, so the collector deletes them.
+    let first = controller.until(builder.pid, "PackageGcAcquired", "a", "compile");
+    let mut command = out_link_collector(&p, &gc, &home);
+    command
+        .env("CARGO_BUILD_GC_MAX_UNUSED", "0 seconds")
+        .env("CARGO_BUILD_GC_MAX_SIZE", "0");
+    let collector = controller.spawn(command);
+    success(collector.wait(&mut controller));
+    first.resume(0);
+    success(builder.wait(&mut controller));
+    run_binary(&p.bin("consumer-b"), b"A A\n");
+}
+
 fn abba_fixture() -> (Project, PathBuf, PathBuf) {
     let p = git::new("foo", |p| {
         p.file(
