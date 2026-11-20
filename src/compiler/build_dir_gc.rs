@@ -308,7 +308,12 @@ fn run_inner(build_runner: &BuildRunner<'_, '_>, build_start: SystemTime) -> Car
             let target_dir = ws.target_dir().into_path_unlocked();
             collect_orphan_outputs(&target_dir, settings.max_unused, &mut removed)?;
             if !root.starts_with(&target_dir) {
-                collect_foreign_outputs(&target_dir, FOREIGN_OUTPUTS_MAX_UNUSED, &mut removed)?;
+                collect_foreign_outputs(
+                    gctx,
+                    &target_dir,
+                    FOREIGN_OUTPUTS_MAX_UNUSED,
+                    &mut removed,
+                )?;
             }
         }
         touch(&marker, now)?;
@@ -739,6 +744,7 @@ fn collect_orphan_outputs(
 /// only links outputs into the target-dir, so it never uses them. Only
 /// directories nothing has written to for `max_unused` go.
 fn collect_foreign_outputs(
+    gctx: &GlobalContext,
     target_dir: &Path,
     max_unused: Duration,
     removed: &mut Removed,
@@ -756,11 +762,19 @@ fn collect_foreign_outputs(
         }
     }
     for profile in profiles {
-        for name in ["deps", "incremental", "build", ".fingerprint"] {
-            let dir = profile.join(name);
-            if !dir.is_dir() || age(newest_mtime_within(&dir, max_unused)) <= max_unused {
-                continue;
-            }
+        let is_stale =
+            |dir: &Path| dir.is_dir() && age(newest_mtime_within(dir, max_unused)) > max_unused;
+        let stale: Vec<_> = ["deps", "incremental", "build", ".fingerprint"]
+            .into_iter()
+            .map(|name| profile.join(name))
+            .filter(|dir| is_stale(dir))
+            .collect();
+        if stale.is_empty() {
+            continue;
+        }
+        super::locking::TestHook::for_path(gctx, &profile, "gc")
+            .event("ForeignOutputsCandidate")?;
+        for dir in stale {
             let size = cargo_util::du(&dir, &[]).unwrap_or(0);
             debug!("build.gc removing foreign outputs {}", dir.display());
             paths::remove_dir_all(&dir)?;
@@ -804,7 +818,7 @@ fn collect_idle_projects(
             continue;
         }
         if idle > settings.max_unused {
-            strip_idle_project(&dir, settings.max_unused, removed)?;
+            strip_idle_project(gctx, &dir, settings.max_unused, removed)?;
         }
         projects.push((dir, idle));
     }
@@ -951,7 +965,13 @@ fn disk_space(_path: &Path) -> Option<(u64, u64)> {
 /// Removes what only the next edit of an idle project would use: its
 /// incremental dirs, and `tmp/` entries unused for `max_unused`. Its build
 /// units stay, so building it again as it was rebuilds nothing.
-fn strip_idle_project(dir: &Path, max_unused: Duration, removed: &mut Removed) -> CargoResult<()> {
+fn strip_idle_project(
+    gctx: &GlobalContext,
+    dir: &Path,
+    max_unused: Duration,
+    removed: &mut Removed,
+) -> CargoResult<()> {
+    super::locking::TestHook::for_path(gctx, dir, "gc").event("ProjectGcStripCandidate")?;
     let before = removed.bytes;
     for profile in profile_dirs(dir)? {
         for incremental in read_dirs(&profile.join("incremental"))? {
@@ -1678,7 +1698,13 @@ mod tests {
         }
         // Written a moment ago: a build may be running.
         let mut removed = Removed::default();
-        collect_foreign_outputs(&tmp, Duration::from_secs(3600), &mut removed).unwrap();
+        collect_foreign_outputs(
+            &GlobalContext::default().unwrap(),
+            &tmp,
+            Duration::from_secs(3600),
+            &mut removed,
+        )
+        .unwrap();
         let result = (
             profile.join("deps").exists(),
             profile.join("incremental").exists(),

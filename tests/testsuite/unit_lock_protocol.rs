@@ -737,6 +737,13 @@ fn out_link_collector(p: &Project, cwd: &Path, home: &Path) -> Command {
 // Age fixture data, not an elapsed-time deadline: every candidate is older than
 // the default idle-project retention period before either process starts.
 fn idle_project_fixture(controller: &mut Controller) -> (Project, Project, PathBuf, PathBuf) {
+    aged_project_fixture(controller, filetime::FileTime::from_unix_time(1, 0))
+}
+
+fn aged_project_fixture(
+    controller: &mut Controller,
+    old: filetime::FileTime,
+) -> (Project, Project, PathBuf, PathBuf) {
     let victim = project()
         .at("victim")
         .file(
@@ -764,10 +771,7 @@ fn idle_project_fixture(controller: &mut Controller) -> (Project, Project, PathB
         .collect();
     assert_eq!(roots.len(), 1, "{roots:?}");
     let root = roots.into_iter().next().unwrap();
-    let old = filetime::FileTime::from_unix_time(1, 0);
-    for entry in walkdir::WalkDir::new(&root).contents_first(true) {
-        filetime::set_symlink_file_times(entry.unwrap().path(), old, old).unwrap();
-    }
+    age_tree(&root, old);
     (victim, collector, home, root)
 }
 
@@ -842,6 +846,112 @@ fn idle_project_gc_waiter_reopens_a_lock_from_a_removed_project() {
     reopened.resume(0);
     success(build.wait(&mut controller));
     assert!(root.join("release/.out").is_dir());
+}
+
+// Age fixture data, not an elapsed-time deadline.
+fn days_ago(days: i64) -> filetime::FileTime {
+    filetime::FileTime::from_unix_time(filetime::FileTime::now().unix_seconds() - days * 86_400, 0)
+}
+
+fn age_tree(root: &Path, time: filetime::FileTime) {
+    for entry in walkdir::WalkDir::new(root).contents_first(true) {
+        filetime::set_symlink_file_times(entry.unwrap().path(), time, time).unwrap();
+    }
+}
+
+fn gc_command(p: &Project, home: &Path) -> Command {
+    let mut command = fork_command(p, &p.root(), home, "build --lib", "GC");
+    command
+        .env("CARGO_BUILD_GC_FREQUENCY", "always")
+        .env("CARGO_SHARED_DEPS", "1");
+    command
+}
+
+#[cargo_test]
+fn idle_project_strip_preserves_incremental_of_a_build_started_after_candidate_observation() {
+    let mut controller = Controller::new();
+    let (victim, collector, home, root) = aged_project_fixture(&mut controller, days_ago(2));
+    // Idle for more than a day, less than the week after which it goes whole.
+    let incremental = root.join("debug/incremental/victim-1/session");
+    let stale_tmp = root.join("tmp/old-test/file");
+    for file in [&incremental, &stale_tmp] {
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, "x").unwrap();
+    }
+    age_tree(&root, days_ago(2));
+    let collect = controller.spawn(gc_command(&collector, &home));
+    let candidate = controller.until(collect.pid, "ProjectGcStripCandidate", "", "gc");
+    assert_eq!(candidate.lock(), root);
+    // The project's last use is only rewritten when a build ends, so a build
+    // that starts now still looks idle to the collector.
+    let mut build = fork_command(&victim, &victim.root(), &home, "build --lib", "B");
+    build.env("CARGO_BUILD_GC_FREQUENCY", "never");
+    let build = controller.spawn(build);
+    let held = controller.until(build.pid, "ProjectGcAcquired", "", "layout");
+    assert_eq!(held.lock().parent().unwrap(), root);
+    candidate.resume(0);
+    success(collect.wait(&mut controller));
+    let preserved = incremental.is_file() && stale_tmp.is_file();
+    held.resume(0);
+    success(build.wait(&mut controller));
+    assert!(preserved, "GC stripped a project a build holds");
+
+    // With no build holding the project, the same entries go.
+    age_tree(&root, days_ago(2));
+    success(
+        controller
+            .spawn(gc_command(&collector, &home))
+            .wait(&mut controller),
+    );
+    assert!(!incremental.exists() && !stale_tmp.exists());
+}
+
+#[cargo_test]
+fn foreign_outputs_gc_skips_a_profile_a_stock_cargo_locked_after_candidate_observation() {
+    let mut controller = Controller::new();
+    let p = project()
+        .at("foreign")
+        .file(
+            "Cargo.toml",
+            "[package]\nname='foreign'\nversion='0.1.0'\nedition='2024'\n",
+        )
+        .file("src/lib.rs", "pub fn value() -> u32 { 1 }")
+        .build();
+    let home = controller.dir.path().join("foreign-gc-home");
+    let mut seed = fork_command(&p, &p.root(), &home, "build --lib", "seed");
+    seed.env("CARGO_BUILD_GC_FREQUENCY", "never");
+    success(controller.spawn(seed).wait(&mut controller));
+    // What a stock Cargo builds in `target/debug`, with the lock it holds
+    // for the whole build, and nothing written for more than an hour.
+    let profile = p.root().join("target/debug");
+    assert!(profile.join(".cargo-lock").is_file());
+    let output = profile.join("deps/stock.rlib");
+    fs::create_dir_all(output.parent().unwrap()).unwrap();
+    fs::write(&output, "x").unwrap();
+    let lock_file = profile.join(".cargo-build-lock");
+    fs::write(&lock_file, "").unwrap();
+    for path in [&output, &output.parent().unwrap().to_path_buf()] {
+        filetime::set_file_mtime(path, days_ago(2)).unwrap();
+    }
+    let collect = controller.spawn(gc_command(&p, &home));
+    let candidate = controller.until(collect.pid, "ForeignOutputsCandidate", "", "gc");
+    assert_eq!(candidate.lock(), profile);
+    // The stock Cargo starts after the collector observed the stale outputs.
+    let stock = OpenOptions::new().write(true).open(&lock_file).unwrap();
+    stock.lock().unwrap();
+    candidate.resume(0);
+    success(collect.wait(&mut controller));
+    let preserved = output.is_file();
+    drop(stock);
+    assert!(preserved, "GC removed outputs of a running stock Cargo");
+
+    // Once nothing holds the profile, they go.
+    success(
+        controller
+            .spawn(gc_command(&p, &home))
+            .wait(&mut controller),
+    );
+    assert!(!output.exists());
 }
 
 #[cargo_test]
