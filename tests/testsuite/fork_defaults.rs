@@ -1362,7 +1362,10 @@ fn version_names_the_turtton_release() {
     let manifest = std::env::var_os("CARGO_MANIFEST_DIR").unwrap();
     let release = fs::read_to_string(PathBuf::from(manifest).join("TURTTON_VERSION")).unwrap();
     let release = release.trim();
-    assert!(release.starts_with("0.102.0-") && release.contains("turtton"));
+    assert!(
+        release.starts_with(concat!(env!("CARGO_PKG_VERSION"), "-")) && release.contains("turtton"),
+        "{release}"
+    );
 
     let version = cargo::version().to_string();
     assert!(
