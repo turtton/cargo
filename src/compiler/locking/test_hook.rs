@@ -3,6 +3,7 @@
 
 use crate::CargoResult;
 use crate::compiler::{BuildRunner, Unit};
+use crate::util::GlobalContext;
 use std::path::Path;
 use std::time::Duration;
 
@@ -52,23 +53,25 @@ impl TestHook {
     }
 
     /// GC has no build unit; report the candidate path through the same barrier.
-    pub fn out_link_gc(path: &Path) -> Self {
+    pub fn out_link_gc(gctx: &GlobalContext, path: &Path) -> Self {
         #[cfg(all(unix, debug_assertions))]
         {
-            let data = std::env::var_os("__CARGO_TEST_UNIT_LOCK_SOCKET").map(|socket| {
-                std::sync::Arc::new(Data {
-                    socket: socket.into(),
-                    path: path.into(),
-                    package: String::new(),
-                    target: String::new(),
-                    mode: "gc",
-                })
-            });
+            let data = gctx
+                .get_env_os("__CARGO_TEST_UNIT_LOCK_SOCKET")
+                .map(|socket| {
+                    std::sync::Arc::new(Data {
+                        socket: socket.into(),
+                        path: path.into(),
+                        package: String::new(),
+                        target: String::new(),
+                        mode: "gc",
+                    })
+                });
             Self { data }
         }
         #[cfg(not(all(unix, debug_assertions)))]
         {
-            let _ = path;
+            let _ = (gctx, path);
             Self::default()
         }
     }

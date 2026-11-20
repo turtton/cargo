@@ -833,7 +833,12 @@ fn out_link_gc_only_removes_unused_dangling_links_and_retains_lock_inodes() {
         .unwrap();
     let inode = lock.metadata().unwrap().ino();
     let collector = controller.spawn(out_link_collector(&p, &gc, &home));
-    success(collector.wait(&mut controller));
+    let exit = collector.wait(&mut controller);
+    assert!(
+        exit.stderr.contains("failed to clean the build directory"),
+        "{exit:?}"
+    );
+    success(exit);
     assert!(!dangling.is_symlink());
     assert!(!orphan.is_symlink());
     assert!(orphan.with_extension("lock").is_file());
