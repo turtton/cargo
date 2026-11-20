@@ -82,7 +82,8 @@ jobs:
         run: cargo test --locked -p cargo --lib
       # Substring filters of the testsuite: the fork defaults (which include
       # the removal of the self-update), the build-dir locking and freshness
-      # logic, and the build scripts that read the build directory.
+      # logic, package clean with retained coordination locks, and the build
+      # scripts that read the build directory.
       - name: Fork-specific testsuite modules
         run: |
           cargo test --locked -p cargo --test testsuite -- \
@@ -92,6 +93,8 @@ jobs:
             build_dir:: \
             build_dir_fine_grain_locking:: \
             build_dir_legacy:: \
+            clean:: \
+            clean_legacy_layout:: \
             freshness:: \
             freshness_checksum:: \
             freshness_mtime:: \
@@ -131,6 +134,8 @@ jobs:
             build_dir:: \
             build_dir_fine_grain_locking:: \
             build_dir_legacy:: \
+            clean:: \
+            clean_legacy_layout:: \
             freshness:: \
             freshness_checksum:: \
             freshness_mtime:: \
