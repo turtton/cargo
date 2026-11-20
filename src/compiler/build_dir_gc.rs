@@ -90,7 +90,7 @@ use crate::compiler::locking::{GC_LOCK_FILE, WRITE_LOCK_FILE};
 use crate::compiler::shared_units::{self, OUT_LINKS_DIR};
 use crate::util::flock;
 use crate::util::time_span::maybe_parse_time_span;
-use crate::util::{CargoResult, HumanBytes};
+use crate::util::{CargoResult, GlobalContext, HumanBytes};
 use crate::workspace::features;
 use crate::workspace::gc::parse_human_size;
 use cargo_util::collections::HashSet;
@@ -291,6 +291,7 @@ fn run_inner(build_runner: &BuildRunner<'_, '_>, build_start: SystemTime) -> Car
             continue;
         }
         collect(
+            gctx,
             &dir,
             &live,
             largest_build,
@@ -472,6 +473,7 @@ impl Candidate {
 
 /// Collects one workspace's build-dir, all its targets and profiles together.
 fn collect(
+    gctx: &GlobalContext,
     root: &Path,
     live: &HashSet<PathBuf>,
     largest_build: u64,
@@ -528,7 +530,7 @@ fn collect(
                 candidates.push(Candidate::new(dir.clone(), *last_use));
             }
         }
-        remove_dangling_out_links(profile);
+        remove_dangling_out_links(gctx, profile)?;
         for name in ["deps", ".fingerprint"] {
             let dir = profile.join(name);
             if dir.is_dir() {
@@ -1135,18 +1137,69 @@ fn remove(path: &Path, removed: &mut Removed) -> CargoResult<u64> {
     Ok(size)
 }
 
-/// Removes `--out-dir` symlinks whose unit directory is gone, and their
-/// lock files.
-fn remove_dangling_out_links(profile: &Path) {
-    let Ok(entries) = fs::read_dir(profile.join(OUT_LINKS_DIR)) else {
-        return;
+/// Removes unused dangling `--out-dir` symlinks, retaining lock-file inodes.
+fn remove_dangling_out_links(gctx: &GlobalContext, profile: &Path) -> CargoResult<()> {
+    let entries = match fs::read_dir(profile.join(OUT_LINKS_DIR)) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
     };
-    for entry in entries.flatten() {
-        let link = entry.path();
-        if link.is_symlink() && !link.exists() {
-            let _ = fs::remove_file(&link);
-            let _ = fs::remove_file(link.with_extension("lock"));
+    let mut error = None;
+    for entry in entries {
+        let result = entry
+            .map_err(anyhow::Error::from)
+            .and_then(|entry| remove_dangling_out_link(gctx, &entry.path()));
+        if let Err(e) = result {
+            // A bad entry must neither authorize deletion nor prevent cleanup
+            // of unrelated entries. The caller reports GC errors as warnings.
+            error.get_or_insert(e);
         }
+    }
+    error.map_or(Ok(()), Err)
+}
+
+fn remove_dangling_out_link(gctx: &GlobalContext, link: &Path) -> CargoResult<()> {
+    // Output links have no extension. In particular, do not collect .lock or
+    // .tmp<pid>: with_extension("lock") on a tmp link names its parent's lock.
+    // Leave temporary links entirely to the builder that created them.
+    if link.extension().is_some() || !is_dangling_out_link(link)? {
+        return Ok(());
+    }
+    super::locking::TestHook::out_link_gc(gctx, link).event("OutLinkCandidate")?;
+    // The target may be visible only in the builder's mount namespace. Use
+    // the builder's lock even if no lock file exists yet, without recreating
+    // a removed parent directory. Never unlink this file: waiters may already
+    // have opened its inode.
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(link.with_extension("lock"))?;
+    match flock::try_lock_exclusive(&file) {
+        Ok(()) => {}
+        Err(fs::TryLockError::WouldBlock) => return Ok(()),
+        Err(fs::TryLockError::Error(e)) => return Err(e.into()),
+    }
+    // No other locks may be acquired while this lock is held. A builder could
+    // have repointed the candidate since the first observation.
+    if is_dangling_out_link(link)? {
+        fs::remove_file(link)?;
+    }
+    Ok(())
+}
+
+fn is_dangling_out_link(link: &Path) -> std::io::Result<bool> {
+    match fs::symlink_metadata(link) {
+        Ok(meta) if meta.file_type().is_symlink() => {}
+        Ok(_) => return Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    }
+    match fs::metadata(link) {
+        Ok(_) => Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        // Permission errors, symlink loops, etc. do not prove a missing target.
+        Err(e) => Err(e),
     }
 }
 
@@ -1284,7 +1337,17 @@ mod tests {
             };
             let mut removed = Removed::default();
             let collect = |live: &HashSet<PathBuf>, removed: &mut Removed| {
-                collect(&tmp, live, 0, FileTime::now(), &settings, None, removed).unwrap();
+                collect(
+                    &GlobalContext::default().unwrap(),
+                    &tmp,
+                    live,
+                    0,
+                    FileTime::now(),
+                    &settings,
+                    None,
+                    removed,
+                )
+                .unwrap();
             };
             collect(&HashSet::default(), &mut removed);
             assert!(unit.join("fingerprint/invoked.timestamp").is_file());
@@ -1685,6 +1748,7 @@ mod tests {
             ..GcSettings::default()
         };
         collect(
+            &GlobalContext::default().unwrap(),
             &tmp,
             &HashSet::default(),
             0,
