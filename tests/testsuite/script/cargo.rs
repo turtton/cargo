@@ -1626,7 +1626,11 @@ args: []
 
 "#]]
         .unordered(),
-        &["[..]/debug/[..]".into(), "[..]/.rustc_info.json".into()],
+        &[
+            "[..]/debug/[..]".into(),
+            "[..]/.rustc_info.json".into(),
+            "[..]/.cargo-project-gc-lock".into(),
+        ],
     );
 }
 
