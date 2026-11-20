@@ -909,6 +909,12 @@ fn remove_dangling_out_links(profile: &Path) {
     for entry in entries.flatten() {
         let link = entry.path();
         if link.is_symlink() && !link.exists() {
+            if super::locking::TestHook::out_link_gc(&link)
+                .event("OutLinkCandidate")
+                .is_err()
+            {
+                continue;
+            }
             let _ = fs::remove_file(&link);
             let _ = fs::remove_file(link.with_extension("lock"));
         }

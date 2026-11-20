@@ -51,6 +51,28 @@ impl TestHook {
         }
     }
 
+    /// GC has no build unit; report the candidate path through the same barrier.
+    pub fn out_link_gc(path: &Path) -> Self {
+        #[cfg(all(unix, debug_assertions))]
+        {
+            let data = std::env::var_os("__CARGO_TEST_UNIT_LOCK_SOCKET").map(|socket| {
+                std::sync::Arc::new(Data {
+                    socket: socket.into(),
+                    path: path.into(),
+                    package: String::new(),
+                    target: String::new(),
+                    mode: "gc",
+                })
+            });
+            Self { data }
+        }
+        #[cfg(not(all(unix, debug_assertions)))]
+        {
+            let _ = path;
+            Self::default()
+        }
+    }
+
     pub fn event(&self, phase: &str) -> CargoResult<Option<Duration>> {
         #[cfg(all(unix, debug_assertions))]
         if let Some(data) = &self.data {

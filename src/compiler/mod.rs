@@ -398,6 +398,9 @@ fn rustc(
         .as_ref()
         .and_then(|s| s.record(unit, &build_runner.files().build_unit_dir(unit)));
     let out_dir_link = build_runner.files().out_dir_link(unit);
+    let out_dir_hook = out_dir_link
+        .as_ref()
+        .map(|link| locking::TestHook::new(build_runner, unit, link));
     let artifact = unit.artifact;
     let sbom_files = build_runner.sbom_output_files(unit)?;
     let sbom = if !sbom_files.is_empty() {
@@ -502,6 +505,7 @@ fn rustc(
             Some(link) => {
                 let lock = shared_units::lock_out_dir(link)?;
                 shared_units::point_out_dir(link, &root)?;
+                out_dir_hook.as_ref().unwrap().event("OutDirLinked")?;
                 Some(lock)
             }
             None => None,
