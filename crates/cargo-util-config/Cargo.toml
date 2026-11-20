@@ -1,7 +1,7 @@
 [package]
 name = "cargo-util-config"
 version = "0.1.0"
-rust-version = "1.99"  # MSRV:1
+rust-version = "1.100"  # MSRV:1
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -16,10 +16,13 @@ cargo-credential.workspace = true
 cargo-util.workspace = true
 cargo-util-schemas.workspace = true
 cargo-util-terminal.workspace = true
+regex.workspace = true
 schemars = { workspace = true, features = ["preserve_order", "semver1"], optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde-untagged.workspace = true
 toml = { workspace = true, features = ["std", "serde", "parse", "display", "preserve_order"] }
+toml_parser.workspace = true
+toml_writer.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

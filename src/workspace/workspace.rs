@@ -15,8 +15,8 @@ use url::Url;
 use crate::compiler::Unit;
 use crate::context;
 use crate::context::{
-    CargoResolverConfig, ConfigRelativePath, ConfigRelativePathResolveExt, FeatureUnification,
-    IncompatibleRustVersions, Value,
+    CargoResolverConfig, ConfigRootRelativePathTemplate, FeatureUnification,
+    IncompatibleRustVersions, PatchDependency, Value,
 };
 use crate::ops;
 use crate::ops::lockfile::LOCKFILE_NAME;
@@ -383,7 +383,7 @@ impl<'gctx> Workspace<'gctx> {
             // Reserve the ability to add templates in the future.
             let replacements: [(&str, &str); 0] = [];
             let path = lockfile_path
-                    .resolve_templated_path(self.gctx(), replacements)
+                    .resolve(self.gctx().cwd(), replacements)
                     .map_err(|e| match e {
                         context::ResolveTemplateError::UnexpectedVariable {
                             variable,
@@ -529,7 +529,7 @@ impl<'gctx> Workspace<'gctx> {
 
     fn default_build_dir(&self) -> Filesystem {
         if self.root_maybe().is_embedded() {
-            let default = ConfigRelativePath::new(
+            let default = ConfigRootRelativePathTemplate::new(
                 "{cargo-cache-home}/build/{workspace-path-hash}"
                     .to_owned()
                     .into(),
@@ -542,7 +542,7 @@ impl<'gctx> Workspace<'gctx> {
         } else {
             // Checkouts of the same project (e.g. many `git worktree`s) share
             // one build-dir so that dependencies are built once.
-            let default = ConfigRelativePath::new(
+            let default = ConfigRootRelativePathTemplate::new(
                 "{cargo-cache-home}/targets/{workspace-name}"
                     .to_owned()
                     .into(),
@@ -609,9 +609,8 @@ impl<'gctx> Workspace<'gctx> {
     }
 
     fn config_patch(&self) -> CargoResult<HashMap<Url, Vec<Patch>>> {
-        let config_patch: Option<
-            BTreeMap<String, BTreeMap<String, Value<TomlDependency<ConfigRelativePath>>>>,
-        > = self.gctx.get(["patch"])?;
+        let config_patch: Option<BTreeMap<String, BTreeMap<String, Value<PatchDependency>>>> =
+            self.gctx.get(["patch"])?;
 
         let source = SourceId::for_manifest_path(self.root_manifest())?;
 

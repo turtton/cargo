@@ -58,7 +58,7 @@ pub fn get(gctx: &GlobalContext, opts: &GetOptions<'_>) -> CargoResult<()> {
         );
     }
     let key = match opts.key {
-        Some(key) => ConfigKey::from_str(key),
+        Some(key) => key.parse()?,
         None => ConfigKey::new(),
     };
     if opts.merged {
@@ -311,8 +311,8 @@ fn print_toml_unmerged(
         drop_println!(gctx, "");
     }
 
-    let unmerged = gctx.load_config_unmerged()?;
-    for config in unmerged {
+    let unmerged = gctx.config_loader().load_unmerged_from(gctx.cwd())?;
+    for config in unmerged.into_iter().rev() {
         let mut cv = config.into_value();
         if trim_cv(&mut cv, key)? {
             print_table(&cv);

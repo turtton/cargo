@@ -100,6 +100,25 @@ fn mix_of_hierarchy_and_include() {
 }
 
 #[cargo_test]
+fn same_file_included_twice_from_hierarchy() {
+    write_config_at("foo/.cargo/config.toml", "include = ['../../shared.toml']");
+    write_config_at(".cargo/config.toml", "include = ['../shared.toml']");
+    write_config_at(
+        "shared.toml",
+        "
+        key = 1
+        list = ['shared']
+        ",
+    );
+    let gctx = GlobalContextBuilder::new().cwd("foo").build();
+    assert_eq!(gctx.get::<i32>(["key"]).unwrap(), 1);
+    assert_eq!(
+        gctx.get::<Vec<String>>(["list"]).unwrap(),
+        vec!["shared".to_string(), "shared".to_string()]
+    );
+}
+
+#[cargo_test]
 fn left_to_right_bottom_to_top() {
     // How it merges multiple nested includes.
     write_config_at(
@@ -260,6 +279,81 @@ Caused by:
     );
 }
 
+/// The same file got `include`d twice in one include tree.
+///
+/// We currently treat it as "cycle" and bail out.
+#[cargo_test]
+fn diamond_include() {
+    write_config_at(
+        ".cargo/config.toml",
+        "include = ['left.toml', 'right.toml']",
+    );
+    write_config_at(".cargo/left.toml", "include = ['shared.toml']");
+    write_config_at(".cargo/right.toml", "include = ['shared.toml']");
+    write_config_at(".cargo/shared.toml", "key = 1");
+    let gctx = GlobalContextBuilder::new().build();
+    assert_error(
+        gctx.get::<i32>(["key"]).unwrap_err(),
+        str![[r#"
+could not load Cargo configuration
+
+Caused by:
+  failed to load config include `right.toml` from `[ROOT]/.cargo/config.toml`
+
+Caused by:
+  failed to load config include `shared.toml` from `[ROOT]/.cargo/right.toml`
+
+Caused by:
+  config `include` cycle detected with path `[ROOT]/.cargo/shared.toml`
+"#]],
+    );
+}
+
+#[cargo_test]
+fn merge_failed_between_file_and_include() {
+    write_config_at(
+        ".cargo/config.toml",
+        "
+        include = ['other.toml']
+        foo = ['a']
+        ",
+    );
+    write_config_at(".cargo/other.toml", "foo = 'b'");
+    let gctx = GlobalContextBuilder::new().build();
+    assert_error(
+        gctx.get::<i32>(["foo"]).unwrap_err(),
+        str![[r#"
+could not load Cargo configuration
+
+Caused by:
+  failed to merge key `foo` between [ROOT]/.cargo/config.toml and [ROOT]/.cargo/other.toml
+
+Caused by:
+  failed to merge config value from `[ROOT]/.cargo/other.toml` into `[ROOT]/.cargo/config.toml`: expected array, but found string
+"#]],
+    );
+}
+
+#[cargo_test]
+fn merge_failed_between_includes() {
+    write_config_at(".cargo/config.toml", "include = ['one.toml', 'two.toml']");
+    write_config_at(".cargo/one.toml", "foo = ['a']");
+    write_config_at(".cargo/two.toml", "foo = 'b'");
+    let gctx = GlobalContextBuilder::new().build();
+    assert_error(
+        gctx.get::<i32>(["foo"]).unwrap_err(),
+        str![[r#"
+could not load Cargo configuration
+
+Caused by:
+  failed to merge key `foo` between [ROOT]/.cargo/two.toml and [ROOT]/.cargo/one.toml
+
+Caused by:
+  failed to merge config value from `[ROOT]/.cargo/one.toml` into `[ROOT]/.cargo/two.toml`: expected string, but found array
+"#]],
+    );
+}
+
 #[cargo_test]
 fn cli_include() {
     // Using --config with include.
@@ -337,10 +431,10 @@ fn cli_merge_failed() {
     assert_error(
         gctx.unwrap_err(),
         str![[r#"
-failed to merge key `foo` between [ROOT]/.cargo/config.toml and [ROOT]/.cargo/other.toml
+failed to merge key `foo` between [ROOT]/.cargo/other.toml and [ROOT]/.cargo/config.toml
 
 Caused by:
-  failed to merge config value from `[ROOT]/.cargo/other.toml` into `[ROOT]/.cargo/config.toml`: expected array, but found string
+  failed to merge config value from `[ROOT]/.cargo/config.toml` into `[ROOT]/.cargo/other.toml`: expected string, but found array
 "#]],
     );
 }

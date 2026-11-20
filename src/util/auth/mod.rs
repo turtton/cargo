@@ -12,8 +12,8 @@ use cargo_credential::{
 };
 
 use core::fmt;
+use jiff::{SignedDuration, Timestamp};
 use std::error::Error;
-use time::{Duration, OffsetDateTime};
 use url::Url;
 
 use crate::context::Value;
@@ -21,9 +21,7 @@ use crate::util::credential::adaptor::BasicProcessCredential;
 use crate::workspace::SourceId;
 
 use super::{credential::process::CredentialProcessCredential, credential::token::TokenCredential};
-use crate::context::{
-    ConfigRelativePathResolveExt, CredentialCacheValue, PathAndArgs, RegistryConfig,
-};
+use crate::context::{CredentialCacheValue, PathAndArgs, RegistryConfig};
 
 /// Get the list of credential providers for a registry source.
 fn credential_provider(
@@ -113,7 +111,7 @@ fn credential_provider(
 /// Use the `[credential-alias]` table to see if the provider name has been aliased.
 fn resolve_credential_alias(gctx: &GlobalContext, mut provider: PathAndArgs) -> Vec<String> {
     if provider.args.is_empty() {
-        let name = provider.path.raw_value();
+        let name = provider.path.as_str();
         let key = format!("credential-alias.{name}");
         if let Ok(alias) = gctx.get::<Value<PathAndArgs>>(["credential-alias", name]) {
             tracing::debug!("resolving credential alias '{key}' -> '{alias:?}'");
@@ -132,7 +130,7 @@ fn resolve_credential_alias(gctx: &GlobalContext, mut provider: PathAndArgs) -> 
         0,
         provider
             .path
-            .resolve_program(gctx)
+            .resolve(gctx.cwd())
             .to_str()
             .unwrap()
             .to_string(),
@@ -223,7 +221,7 @@ impl fmt::Display for AuthorizationError {
                 self.sid.display_registry_name()
             )?;
             if self.supports_cargo_token_credential_provider {
-                let key = ConfigKey::from_str(&format!("registries.{name}.token"));
+                let key = ConfigKey::from_parts(["registries", name, "token"]);
                 write!(
                     f,
                     ", please run `cargo login --registry {name}`\n\
@@ -422,7 +420,7 @@ fn auth_token_optional(
     if let Some(cached_token) = cache.get(url) {
         if cached_token
             .expiration
-            .map(|exp| OffsetDateTime::now_utc() + Duration::minutes(1) < exp)
+            .map(|exp| Timestamp::now() + SignedDuration::from_mins(1) < exp)
             .unwrap_or(true)
         {
             if cached_token.operation_independent || matches!(operation, Operation::Read) {

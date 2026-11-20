@@ -23,14 +23,14 @@ Cargo has the concept of a "lint group",
 where you can toggle several warnings through one name.
 
 
-| Group                | Description                                                                         | Default level |
-|----------------------|-------------------------------------------------------------------------------------|---------------|
-| `cargo::default`     | all lints that are on by default (correctness, suspicious, style, complexity, perf) | warn/deny     |
-| `cargo::correctness` | code that is outright wrong or useless                                              | deny          |
-| `cargo::style`       | code that should be written in a more idiomatic way                                 | warn          |
-| `cargo::suspicious`  | code that is most likely wrong or useless                                           | warn          |
-| `cargo::pedantic`    | lints which are rather strict or have occasional false positives                    | allow         |
-| `cargo::restriction` | lints which prevent the use of Cargo features                                       | allow         |
+| Group                | Description                                                       | Default level |
+|----------------------|-------------------------------------------------------------------|---------------|
+| `cargo::default`     | all lints that are on by default (correctness, style, suspicious) | warn/deny     |
+| `cargo::correctness` | code that is outright wrong or useless                            | deny          |
+| `cargo::style`       | code that should be written in a more idiomatic way               | warn          |
+| `cargo::suspicious`  | code that is most likely wrong or useless                         | warn          |
+| `cargo::pedantic`    | lints which are rather strict or have occasional false positives  | allow         |
+| `cargo::restriction` | lints which prevent the use of Cargo features                     | allow         |
 
 
 ## Allowed-by-default
@@ -469,7 +469,7 @@ they are unchecked.
 
 Examples:
 - `cargo check` will lint `[build-dependencies]` and `[dependencies]`
-- `cargo check --all-targets` will still only lint `[build-dependencies]` and `[dependencies]` and not `[dev-dependencoes]`
+- `cargo check --all-targets` will still only lint `[build-dependencies]` and `[dependencies]` and not `[dev-dependencies]`
 - `cargo check --bin foo` will not lint `[dependencies]` even if `foo` is the only bin though `[build-dependencies]` will be checked
 - `cargo check -p foo` will not lint any dependencies tables for the `path` dependency `bar` even if `bar` only has a `[lib]`
 

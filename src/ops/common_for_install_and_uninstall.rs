@@ -13,7 +13,7 @@ use ops::FilterRule;
 use serde::{Deserialize, Serialize};
 
 use crate::compiler::{DirtyReason, Freshness};
-use crate::context::{ConfigRelativePath, ConfigRelativePathResolveExt, Definition};
+use crate::context::{ConfigRootRelativeProgramPath, Definition};
 use crate::ops::{self, CompileFilter, CompileOptions};
 use crate::sources::IndexSummary;
 use crate::sources::PathSource;
@@ -546,11 +546,13 @@ impl InstallInfo {
 
 /// Determines the root directory where installation is done.
 pub fn resolve_root(flag: Option<&str>, gctx: &GlobalContext) -> CargoResult<Filesystem> {
-    let config_root = match gctx.get::<Option<ConfigRelativePath>>(["install", "root"])? {
+    let config_root = match gctx
+        .get::<Option<ConfigRootRelativeProgramPath>>(["install", "root"])?
+    {
         Some(p) => {
-            let resolved = p.resolve_program(gctx);
+            let resolved = p.resolve(gctx.cwd());
             if resolved.is_relative() {
-                let definition = p.value().definition.clone();
+                let definition = p.definition();
                 if matches!(definition, Definition::Path(_)) {
                     let suggested = format!("{}/", resolved.display());
                     let notes = [
