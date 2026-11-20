@@ -802,6 +802,12 @@ fn collect_foreign_outputs(
 /// The exclusive `<profile>/.cargo-build-lock` of a stock Cargo's profile, or
 /// `None` when a build holds it or it does not exist.
 fn lock_foreign_profile(profile: &Path) -> CargoResult<Option<fs::File>> {
+    // Cargo does not lock on NFS (it cannot rely on the locks there), so a
+    // free lock proves nothing about a build running on such a mount.
+    if flock::is_on_nfs_mount(profile) {
+        debug!("build.gc skipping {}: on NFS", profile.display());
+        return Ok(None);
+    }
     let file = match fs::File::open(profile.join(".cargo-build-lock")) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
